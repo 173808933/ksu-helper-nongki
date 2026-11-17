@@ -1,0 +1,241 @@
+{
+  "_note": "设备档案：机型/内核匹配后注入 GL_* 地址（仅在“使用档案地址”开关打开时）。地址来自各机型 conf.json 的 env_recipe。 5.4 档案的 GL_SIGENFORCE 用同页空白地址，因为 5.4 没有 sig_enforce 变量。",
+  "profiles": [
+    {
+      "id": "oppo_pad_opd2101",
+      "name": "OPPO Pad (OPD2101)",
+      "models": [
+        "OPD2101",
+        "OPPO Pad"
+      ],
+      "kernel": "4.19.157",
+      "soc": "SM8250-AC 骁龙870",
+      "env": {
+        "GL_CROFF": "0x7e0",
+        "GL_REALCRED": "0x7d8",
+        "GL_INITCRED": "0x2bacf08",
+        "GL_INITTASK": "0x2b9cc40",
+        "GL_SIGENFORCE": "0x2bbc370",
+        "GL_PARANOID": "0x2b8e254",
+        "GL_SELINUX": "0x3c88000",
+        "GL_SCRATCH": "0x3c88800"
+      },
+      "note": "selinux_state 比 Find X3 高 0x24000，地址不可混用"
+    },
+    {
+      "id": "oppo_reno5pro_pdsm00",
+      "name": "OPPO Reno5 Pro 5G (PDSM00)",
+      "models": [
+        "PDSM00"
+      ],
+      "kernel": "4.19.191",
+      "soc": "MT6889Z 天玑1000+",
+      "env": {
+        "GL_CROFF": "0x768",
+        "GL_REALCRED": "0x760",
+        "GL_INITTASK": "0x20fcc00",
+        "GL_INITCRED": "0x2109bb0",
+        "GL_SELINUX": "0x277e218",
+        "GL_SIGENFORCE": "0x2115fe0",
+        "GL_PARANOID": "0x20ee1ac",
+        "GL_SCRATCH": "0x277ea18"
+      },
+      "note": "4.19.191+ / MT6889Z。四个偏移自 OTA boot.img 反汇编标定：init_cred 由 init_task+0x768 读出(usage=4 校验)、selinux_state 取自 selinux_avc_init、sig_enforce 取自 is_module_sig_enforced(初值1)、mmap_min_addr 取自 mmap_min_addr_handler(初值4096)"
+    },
+    {
+      "id": "oppo_findx3_pedm00",
+      "name": "OPPO Find X3 (PEDM00)",
+      "models": [
+        "PEDM00"
+      ],
+      "kernel": "4.19.157",
+      "soc": "SM8250",
+      "env": {
+        "GL_CROFF": "0x7e0",
+        "GL_REALCRED": "0x7d8",
+        "GL_INITCRED": "0x2bacf08",
+        "GL_INITTASK": "0x2b9cc40",
+        "GL_SIGENFORCE": "0x2bbc370",
+        "GL_PARANOID": "0x2b8e254",
+        "GL_SELINUX": "0x3c64000",
+        "GL_SCRATCH": "0x3c64800"
+      },
+      "note": "PC 侧 root.sh 已实测通过"
+    },
+    {
+      "id": "oneplus_9r_le2100",
+      "name": "OnePlus 9R (LE2100)",
+      "models": [
+        "LE2100"
+      ],
+      "kernel": "4.19.157",
+      "soc": "SM8250-AC",
+      "env": {
+        "GL_CROFF": "0x7e0",
+        "GL_REALCRED": "0x7d8",
+        "GL_INITCRED": "0x29acf08",
+        "GL_INITTASK": "0x299cc40",
+        "GL_SIGENFORCE": "0x29bc370",
+        "GL_PARANOID": "0x298e254",
+        "GL_SELINUX": "0x37b6000",
+        "GL_SCRATCH": "0x37b6800"
+      },
+      "note": "未真机验证"
+    },
+    {
+      "id": "oppo_a2m_pju110",
+      "name": "OPPO A2m (PJU110)",
+      "models": [
+        "PJU110"
+      ],
+      "kernel": "4.19.191",
+      "soc": "MT6833",
+      "env": {
+        "GL_CROFF": "0x768",
+        "GL_REALCRED": "0x760",
+        "GL_INITCRED": "0x2a7d068",
+        "GL_INITTASK": "0x2a73700",
+        "GL_SIGENFORCE": "0x2a8aaf8",
+        "GL_PARANOID": "0x29e3fc8",
+        "GL_SELINUX": "0x3138c18",
+        "GL_SCRATCH": "0x3139418"
+      },
+      "note": "CFI 开启，模块需 CFI 版"
+    },
+    {
+      "id": "oppo_a2pro_pjg110",
+      "name": "OPPO A2 Pro (PJG110)",
+      "models": [
+        "PJG110"
+      ],
+      "kernel": "4.19.191",
+      "soc": "MT6835",
+      "env": {
+        "GL_CROFF": "0x768",
+        "GL_REALCRED": "0x760",
+        "GL_INITCRED": "0x26ac820",
+        "GL_INITTASK": "0x26a1080",
+        "GL_SIGENFORCE": "0x26b9368",
+        "GL_PARANOID": "0x268e3b0",
+        "GL_SELINUX": "0x2e967e0",
+        "GL_SCRATCH": "0x2e96fe0"
+      },
+      "note": ""
+    },
+    {
+      "id": "oppo_a97_pftm10",
+      "name": "OPPO A97 (PFTM10)",
+      "models": [
+        "PFTM10"
+      ],
+      "kernel": "4.19.191",
+      "soc": "MT6833",
+      "env": {
+        "GL_CROFF": "0x768",
+        "GL_REALCRED": "0x760",
+        "GL_INITCRED": "0x2a7d028",
+        "GL_INITTASK": "0x2a73660",
+        "GL_SIGENFORCE": "0x2a8aa70",
+        "GL_PARANOID": "0x29e3fbc",
+        "GL_SELINUX": "0x3138c00",
+        "GL_SCRATCH": "0x3139400"
+      },
+      "note": "CFI 开启"
+    },
+    {
+      "id": "xiaomi_12x_psyche",
+      "name": "Xiaomi 12X (PSYCHE)",
+      "models": [
+        "PSYCHE",
+        "12X"
+      ],
+      "kernel": "4.19.157",
+      "soc": "SM8250-AC",
+      "env": {
+        "GL_CROFF": "0x7e8",
+        "GL_REALCRED": "0x7e0",
+        "GL_INITCRED": "0x2fa0900",
+        "GL_INITTASK": "0x2f98ef0",
+        "GL_SIGENFORCE": "0x343c844",
+        "GL_PARANOID": "0x2f86b00",
+        "GL_SELINUX": "0x3c64ab8",
+        "GL_SCRATCH": "0x3c652b8"
+      },
+      "note": "kallsyms 布局不同；未验证"
+    },
+    {
+      "id": "auto",
+      "name": "通用（仅自动推导，不注入地址）",
+      "models": [],
+      "kernel": "",
+      "soc": "-",
+      "env": {},
+      "note": "使用 GL_AUTO=1，由 p7 自行推导偏移"
+    },
+    {
+      "id": "oppo_reno7_pfjm10_54",
+      "name": "OPPO Reno7 (PFJM10) · 5.4.254",
+      "models": [
+        "PFJM10"
+      ],
+      "kernel": "5.4.254",
+      "soc": "SM7325 骁龙778G",
+      "env": {
+        "GL_CROFF": "0x808",
+        "GL_REALCRED": "0x800",
+        "GL_INITCRED": "0x2caf850",
+        "GL_INITTASK": "0x2ca2800",
+        "GL_SIGENFORCE": "0x2f07400",
+        "GL_PARANOID": "0x2bb0048",
+        "GL_SELINUX": "0x2f07000",
+        "GL_SCRATCH": "0x2f07800"
+      },
+      "note": "5.4：MODULE_SIG 未开所以无 sig_enforce，GL_SIGENFORCE 指向 selinux_state 同页空白（写入无害）；cred 0x808"
+    },
+    {
+      "id": "oppo_reno6pro_peem00",
+      "name": "OPPO Reno6 Pro 5G",
+      "models": [
+        "PEPM00",
+        "PEEM00",
+        "CPH2249"
+      ],
+      "kernel": "4.19.191",
+      "soc": "MT6893 天玑1200",
+      "env": {
+        "GL_CROFF": "0x768",
+        "GL_REALCRED": "0x760",
+        "GL_INITTASK": "0x218d6c0",
+        "GL_INITCRED": "0x2199890",
+        "GL_SELINUX": "0x2882808",
+        "GL_SCRATCH": "0x2883008",
+        "GL_SIGENFORCE": "0x21a5ee0",
+        "GL_PARANOID": "0x217e1ac",
+        "GL_TMODE": "2"
+      },
+      "note": "4.19.191+ / MT6893。八个偏移自 OTA boot.img 反汇编标定：init_cred 由 init_task+0x768 读出(usage=4 双点校验)、selinux_state 取自 selinux_avc_init、sig_enforce 取自 is_module_sig_enforced(初值1)、perf_event_paranoid 取自 perf_event_open(初值2)、scratch=selinux+0x800；GL_TMODE=2 加大 perf 采样等待（getpid x100000），本机 hits 只有 6/4095 需要更长窗口"
+    },
+    {
+      "id": "oppo_a93_54",
+      "name": "OPPO A93 · 5.4.254",
+      "models": [
+        "PEHM00",
+        "PCAM00",
+        "CPH2127"
+      ],
+      "kernel": "5.4.254",
+      "soc": "SM4350 骁龙480",
+      "env": {
+        "GL_CROFF": "0x808",
+        "GL_REALCRED": "0x800",
+        "GL_INITTASK": "0x27a5980",
+        "GL_INITCRED": "0x27b2a88",
+        "GL_SELINUX": "0x29c0000",
+        "GL_SCRATCH": "0x29c0800",
+        "GL_SIGENFORCE": "0x27bd7a0",
+        "GL_PARANOID": "0x274fef0"
+      },
+      "note": "5.4.254-qgki-g9ef4a332d496。该内核 KALLSYMS_ALL=y，八个符号直接在表里：init_cred usage=4、sig_enforce 初值1、perf_paranoid 初值2 均校验通过；cred 偏移由 prepare_creds 的 ldr[x22,#2056]/[x22,#2048] 得出"
+    }
+  ]
+}

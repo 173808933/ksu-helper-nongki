@@ -1,0 +1,64 @@
+# ---- 大体积目录（不是源码，不进仓库）----
+partitions-backup*/
+build-target/
+ota/
+_dl/
+edl-tool/
+ref/
+_tmp/
+_tmp_ref/
+ktree/
+ktree2/
+hdr/
+hdr2/
+hdr3/
+t/
+port/
+sepol/
+unlock-stage/
+build/
+p331/
+p331obj/
+t331obj/
+t331obj/
+
+# 内核树（_gl54 里那份 1GB 的厂商源码）
+_gl54/kernel/
+
+# ---- 二进制产物 ----
+*.apk
+*.img
+*.ko
+*.zip
+*.tar.*
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+
+# 构建中间件
+kernelsu/src/kernel/*.o
+kernelsu/src/kernel/kernelsu.ko
+kernelsu/src/kernel/kernelsu.stripped.ko
+kernelsu/src/kernel/.*.cmd
+kernelsu/src/kernel/.tmp_*
+kernelsu/src/kernel/modules.order
+kernelsu/src/kernel/Module.symvers
+
+# ---- 杂项 ----
+*.log
+*.png
+*.jpg
+*.jpeg
+*.bak
+*.bak-*
+.DS_Store
+Thumbs.db
+
+# 无关的大文件与构建缓存
+oneplus9-kallsyms.txt
+.gradle/
+ghostlock54
+_gl54/ghostlock54

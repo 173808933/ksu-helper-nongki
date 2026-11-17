@@ -1,0 +1,4 @@
+/* 空桩，同上 */
+#ifndef _SELINUX_AV_PERMISSIONS_STUB_H_
+#define _SELINUX_AV_PERMISSIONS_STUB_H_
+#endif
