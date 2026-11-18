@@ -1454,7 +1454,14 @@ class MainActivity : ComponentActivity() {
             //   拿不到时模块内部符号解析走 /proc/kallsyms，被 kptr_restrict 挡住，
             //   结果 GET_INFO 返回的 flags 全零 —— 管理器据此判「内核不支持」。
             //   level=3 让模块把详细日志打到 kmsg。
-            val kln = sh("grep ' kallsyms_lookup_name$' /proc/kallsyms 2>/dev/null | head -1 | cut -d' ' -f1", 15).out.trim()
+            // kptr_restrict=2 时，uid=2000 读 /proc/kallsyms 只能看到全 0 —— 即使此刻已经
+            // 提权成功，sh() 走的仍是 Shizuku 的 shell(2000)，不是 root。
+            // 所以先用 rksh 把限制降到 0（临时，重启恢复），再用 shell 读。
+            sh("/data/local/tmp/rksh -c 'echo 0 > /proc/sys/kernel/kptr_restrict' 2>&1", 15)
+            val kptrNow = sh("cat /proc/sys/kernel/kptr_restrict 2>/dev/null", 10).out.trim()
+            log("  kptr_restrict -> ${kptrNow.ifBlank { "?" }}")
+            // 限定 T 类型：不加的话可能匹配到 __ksymtab_kallsyms_lookup_name 之类的引用
+            val kln = sh("grep ' T kallsyms_lookup_name$' /proc/kallsyms 2>/dev/null | head -1 | cut -d' ' -f1", 20).out.trim()
             val klnArg = if (kln.length > 8 && kln != "0000000000000000") " kln=0x$kln" else ""
             if (klnArg.isEmpty()) {
                 // 模块不内建 kallsyms 表，符号全靠这个地址去查。
@@ -1770,7 +1777,9 @@ class MainActivity : ComponentActivity() {
                     return@withContext
                 }
                 val t = System.currentTimeMillis()
-                val kln2 = sh("grep ' kallsyms_lookup_name$' /proc/kallsyms 2>/dev/null | head -1 | cut -d' ' -f1", 15).out.trim()
+                // 同主流程：先用 root 解除 kptr_restrict，否则 shell 读到全 0
+                sh("/data/local/tmp/rksh -c 'echo 0 > /proc/sys/kernel/kptr_restrict' 2>&1", 15)
+                val kln2 = sh("grep ' T kallsyms_lookup_name$' /proc/kallsyms 2>/dev/null | head -1 | cut -d' ' -f1", 20).out.trim()
                 val klnArg2 = if (kln2.length > 8 && kln2 != "0000000000000000") " kln=0x$kln2" else ""
                 if (klnArg2.isEmpty()) {
                     log("!! 取不到 kallsyms_lookup_name，中止 insmod（没有 kln 的模块是空壳）")
