@@ -8,6 +8,40 @@
 
 ## 2026-11-18
 
+### 重启后重新提权：p7 卡在 CMP_REQUEUE_PI，隧道随后掉了
+
+**重启后状态**：boot_id `05cbc04e-…`（干净），Shizuku 延迟约 3 分钟后自己恢复，
+RBK 从 `untrusted_app` 回到 `uid=2000 shell`。
+
+**p7 裸跑用错偏移**：不带 `GL_*` 时日志打印
+`selinux=0x3c64000`，那是 **Find X3 的默认值**；Pad 档案是 `0x3c88000`（高 0x24000）。
+App 的 `profiles.json` 里 `oppo_pad_opd2101` 条目才是对的。
+
+**带正确环境仍然失败**：
+
+```
+GL_ATTR=cred GL_PERM=1 GL_ZEROSIG=1 GL_RETRY=2 GL_RCRED=1 GL_PRIV=1
+GL_SELINUX=0x3c88000 ... ./p7
+→ CMP_REQUEUE_PI ret=-1 errno=35 (EAGAIN)，稳定复现
+```
+
+带上 `GL_ATTR=cred` 后流程会走到 `[waiter] phase0 kind=3 … phase1 kind=2 off=0x2bbc370`，
+比裸跑远，但仍没有 `scontext=u:r:kernel:s0`，没有提权成功。
+最后一次尝试直接挂住（2 分钟无输出），随后 **VPS 上 27790 监听消失**，隧道断了。
+
+**KSU Helper 的 ADB 广播接口实测**
+
+- `am broadcast -f 0x20 -n com.xxl.ksuhelper/.AdbReceiver -a com.xxl.ksuhelper.CMD --es cmd status`
+  **可以**，能返回设备/内核/boot_id/shizuku 状态
+- 但 `--es cmd shell --es arg ...` **跑不起来**，`status` 里自带的那句
+  `执行失败: IllegalArgumentException: process hasn't exited`
+  就是 DELIVERY 第 1 条记的 Shizuku `waitFor()` bug
+- 注意：必须带 `-n` 指定组件 + `-f 0x20`，只用 action 会 `result=0`（收不到）
+
+**结论**：广播接口只能读状态，不能执行命令；p7 这条路在本次开机上下文中不稳定。
+
+---
+
 ### 决定性对照实验：这颗内核上模块 init 根本不执行
 
 用三个模块做对照，全部"加载成功但什么都没发生"：
@@ -170,6 +204,34 @@ KernelSU: patch syscall %d failed
 **顺带清掉的残留**
 `/data/local/tmp/kernelsu.ko` 是 13:19 那个 238,760 字节的 strip 版，已确认不是这次加载的文件；
 这次实际用的是 `/sdcard/Download/kernelsu.ko`（4,195,232 字节原始版）。
+
+---
+
+### v8.2（72）— 新增「一键验证并导出」：把验证做成远程可交付
+
+**改了什么**
+- 新增 `runVerifyCollect()`：基线采集 → 释放组件 → 推送引擎 → `ghostlock54 --leak-only`
+  → 汇总 → 自动 `exportLog()`（会弹分享面板）
+- 新增 `BASELINE_CMD`：一条 shell 打完 uname / getprop / boot_id / 四个 sysctl /
+  getenforce / 模块是否在位（原来要十几个 sh 往返）
+- 界面上加一个大按钮「一键验证并导出（不写内核）」，放在「一键提权」上面
+- `runProbe()` 的引擎名改用 `fiveFourEngineAsset()`，并在为空（未标定的 5.4 build）时中止
+- 版本 8.1(71) → 8.2(72)
+
+**为什么**
+设备不在用户手上，需要交给别人操作。原来只有「一键提权」（会写内核）和「推送+探测」
+（跑 probe.sh，但没有引擎自己的 `--leak-only`）。远程操作的人不会看日志，所以要的是
+「点一下 → 出一个文件 → 发回来」：把基线、引擎自检、终态全塞进同一份导出文件，
+失败也带着原因。
+
+**验证**
+- `assembleDebug` 通过；`aapt2 dump badging` 确认 72 / 8.2
+- APK 内 `assets/ghostlock54`(A93, 1,084,088 B)、`ghostlock54-r7`(Reno7, 360,192 B) 都在
+- 没有真机，未实际点过这个按钮
+
+**注意**
+- 这条链路仍然依赖 Shizuku（要用 shell uid 执行，app uid 跑不了引擎也不许写 /data/local/tmp）。
+  Shizuku 可用「无线调试」自启动，Android 11+ 不需要电脑。
 
 ---
 

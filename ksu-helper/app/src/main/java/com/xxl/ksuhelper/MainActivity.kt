@@ -131,6 +131,25 @@ class MainActivity : ComponentActivity() {
      *  所以旧版「只探测」开关是假保险，已移除。 */
     private val kernelVer: String = System.getProperty("os.version") ?: ""
 
+    /** 远程验证用的基线采集：一条 shell 全部打完，避免十几次 sh 往返。
+     *  这些都是只读文件/命令，不需要 root。 */
+    private val BASELINE_CMD: String = listOf(
+        "echo '--- 系统 ---'",
+        "uname -a",
+        "echo -n 'device   : '; getprop ro.product.device",
+        "echo -n 'model    : '; getprop ro.product.model",
+        "echo -n 'build    : '; getprop ro.build.display.id",
+        "echo -n 'boot_id  : '; cat /proc/sys/kernel/random/boot_id",
+        "echo '--- sysctl（决定用户态能做什么）---'",
+        "echo -n 'perf_event_paranoid : '; cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo NA",
+        "echo -n 'kptr_restrict       : '; cat /proc/sys/kernel/kptr_restrict 2>/dev/null || echo NA",
+        "echo -n 'dmesg_restrict      : '; cat /proc/sys/kernel/dmesg_restrict 2>/dev/null || echo NA",
+        "echo -n 'mmap_min_addr       : '; cat /proc/sys/vm/mmap_min_addr 2>/dev/null || echo NA",
+        "echo '--- 安全状态 ---'",
+        "echo -n 'getenforce          : '; getenforce 2>/dev/null || echo NA",
+        "echo -n 'kernelsu 模块       : '; [ -d /sys/module/kernelsu ] && echo 已在位 || echo 未加载"
+    ).joinToString("; ")
+
     private val logBuf = StringBuilder()
     private var lastExportAt = 0L
     private var lastRunLogPath: String? = null
@@ -871,6 +890,67 @@ class MainActivity : ComponentActivity() {
      *
      *  注意：ELf 不能从 /storage/emulated 直接执行（noexec），必须推 /data/local/tmp。
      *  整个函数体在 IO 线程，sh() 是同步阻塞的，在主线程跑 probe.sh 会 ANR。 */
+    /** 真机验证专用：基线 + 引擎自检（--leak-only） + 一键导出分享。
+     *
+     *  为什么单独一条：远程验证时操作的人不是自己，诉求是「点一下 → 出一个文件发回来」。
+     *  全程不写内核内存，最坏情况是 perf 被禁、止步于 KASLR leak failed。
+     *  判据全部落在导出文件里，不需要对方会看日志。 */
+    private fun runVerifyCollect() {
+        if (running) return
+        scope.launch {
+            running = true
+            try {
+                log("========== 一键验证（不写内核）==========")
+                withContext(Dispatchers.IO) {
+                    val engine = if (kernelVer.startsWith("5.4")) fiveFourEngineAsset() else "p7"
+                    if (engine.isEmpty()) {
+                        log("!! 这个 5.4 build 没有标定过引擎（$kernelVer），已停止")
+                        return@withContext
+                    }
+                    busyLabel = "采集基线"
+                    log("== 1/5 基线 ==")
+                    log(sh(BASELINE_CMD, 40).out.trimEnd())
+
+                    busyLabel = "释放组件"
+                    log("== 2/5 释放组件 ==")
+                    val dir = extractAssets()
+                    log("  ${dir.absolutePath}")
+
+                    busyLabel = "推送引擎"
+                    log("== 3/5 推送引擎（$engine）==")
+                    val pushed = pushFile(File(dir, engine), "/data/local/tmp/ghostlock54")
+                    sh("chmod 755 /data/local/tmp/ghostlock54 2>/dev/null", 15)
+                    log("  ${if (pushed) "OK" else "!! 推送失败，后面的自检跳过"}")
+
+                    if (pushed) {
+                        busyLabel = "漏洞自检"
+                        log("== 4/5 --leak-only（只读：KASLR / task / cred）==")
+                        log(sh("cd /data/local/tmp && ./ghostlock54 --leak-only 2>&1", 150).out.trimEnd())
+                    }
+
+                    busyLabel = "整理"
+                    log("== 5/5 汇总 ==")
+                    log(
+                        sh(
+                            "ls -l /data/local/tmp/ghostlock54 2>/dev/null; " +
+                                    "[ -d /sys/module/kernelsu ] && echo '模块: 已在位' || echo '模块: 未加载'; " +
+                                    "echo -n 'SELinux: '; getenforce", 20
+                        ).out.trimEnd()
+                    )
+                }
+                log("========== 验证结束，正在导出 ==========")
+            } catch (e: Throwable) {
+                log("!! 失败: ${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                flushLogText()
+                busyLabel = ""
+                running = false
+            }
+            // 导出会自动弹分享面板，操作的人直接把文件发回来
+            exportLog()
+        }
+    }
+
     private fun runProbe() {
         if (running) return
         scope.launch {
@@ -880,7 +960,11 @@ class MainActivity : ComponentActivity() {
                 withContext(Dispatchers.IO) {
                     val dir = extractAssets()
                     log("  组件目录: ${dir.absolutePath}")
-                    val engine = if (kernelVer.startsWith("5.4")) "ghostlock54" else "p7"
+                    val engine = if (kernelVer.startsWith("5.4")) fiveFourEngineAsset() else "p7"
+                    if (engine.isEmpty()) {
+                        log("  !! 该 5.4 build 没有标定过引擎（$kernelVer），探测停止")
+                        return@withContext
+                    }
 
                     busyLabel = "推送组件"
                     log("== 1/4 推送引擎（$engine）==")
@@ -2039,6 +2123,21 @@ class MainActivity : ComponentActivity() {
                     enabled = !running,
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("APK 完整性检查（不执行引擎）") }
+
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = { runVerifyCollect() },
+                    enabled = !running && permissionGranted,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (running) {
+                        CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = Color.White)
+                        Spacer(Modifier.width(8.dp))
+                        Text(busyLabel.ifBlank { "运行中" })
+                    } else {
+                        Text("一键验证并导出（不写内核）", fontSize = 16.sp)
+                    }
+                }
 
                 Spacer(Modifier.height(8.dp))
                 Button(

