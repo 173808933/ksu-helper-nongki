@@ -22,6 +22,17 @@
             </intent-filter>
         </activity>
 
+        <!-- ADB 接口：am broadcast，action 见下面的 intent-filter。
+             不加权限，普通 shell(2000) 即可发送；
+             实际操作仍受 Shizuku 授权约束 -->
+        <receiver
+            android:name=".AdbReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.xxl.ksuhelper.CMD" />
+            </intent-filter>
+        </receiver>
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

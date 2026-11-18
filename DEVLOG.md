@@ -8,6 +8,37 @@
 
 ## 2026-11-18
 
+### v7.9（69）— 新增 ADB 命令行接口
+
+**改了什么**
+- 新文件 `AdbReceiver.kt`：有序广播接收器，用 `setResultData` 把结果同步回给 adb
+- manifest 注册 `com.xxl.ksuhelper.CMD`，exported、不加权限
+- `docs/ADB.md` 写清用法
+
+**为什么**
+原来只能用 `am start --es run root` 触发，结果只在界面日志里，脚本没法读。
+现在短命令走广播同步返回，适合写进批处理。
+
+**命令集**
+| 命令 | 作用 |
+|---|---|
+| `status` | 设备/内核/Shizuku/模块/rksh/.glhold/ko 一览 |
+| `appid` | 包名与 uid（写 allowlist 用） |
+| `shell` | 执行命令，rksh 存在时自动 root |
+| `kos` | 列出 Download 下 ko 及 vermagic |
+| `clean` | 删 .glhold + ko 缓存 |
+| `doc` | 内置说明 |
+
+长任务（提权 40s、探测 60s）超出广播 10s 限制，仍走 `am start --es run root|probe`。
+
+**踩的坑**
+manifest 注释里写了 `--es cmd status`，**XML 注释不允许出现连续两个减号**，
+`ManifestMerger2` 直接报 `Error parsing AndroidManifest.xml`，
+但 gradle 的 `-q` 模式只输出一行 `FAILED`，一开始误以为是别的问题。
+以后改 manifest 后先跑 `python -c "xml.dom.minidom.parse(...)"` 校验。
+
+---
+
 ### v7.8（68）— ko 改为外置，APK 从 30 MB 回到 16 MB
 
 **改了什么**
