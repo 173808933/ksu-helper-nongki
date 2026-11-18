@@ -182,9 +182,43 @@ python calc54.py Image kernel.elf    # 5.4
 
 ## 七、致谢
 
-- [KernelSU](https://github.com/tiann/KernelSU) — 内核侧实现与 4.14+ 兼容代码
-- [ghostlock-pju110-4.19-ksu](https://github.com/awjdxcy/ghostlock-pju110-4.19-ksu) — ghostlock54 的参考实现与详细文档，本项目的 `insmod kln=` 和 allowlist 格式都源自它
-- 部分偏移标定方法参考 CVE-2026-43499 的公开分析
+本项目的两条提权路线**来自两个不同的上游仓库**。它们的内核假设、参数体系、适用版本完全不同，引擎二进制也不可互换：
+
+### 4.19 路线（`p7` 引擎）
+
+**[awjdxcy/ghostlock-pju110-4.19-ksu](https://github.com/awjdxcy/ghostlock-pju110-4.19-ksu)**
+GhostLock 的 4.19 移植，目标 PJU110 / MT6833 / 4.19.191。
+
+本项目 4.19 侧的设计几乎全部源自它：
+
+- `p7` 的 `GL_*` 环境变量参数体系
+- `insmod kernelsu.ko kln=0x… level=3` 的装载方式（不带 `kln` 就会因符号解析失败被 Manager 判「不支持」）
+- allowlist 的二进制布局（`version@0 / key@4 / curr_uid@260 / allow_su@264 / union@272 / domain@704`，每条 784 字节，792 或 1576 字节文件）
+- 「`init_cred.usage` 只有 4、同一次开机只能跑一次」这条红线
+
+### 5.4 路线（`ghostlock54` 引擎）
+
+**[54gay/ghostlock54-OPPO-Reno7-5G](https://github.com/54gay/ghostlock54-OPPO-Reno7-5G)**
+GhostLock54 的 Reno7 移植，目标 5.4.254-qgki-gaa96eae94d32 / Android 12。
+
+`_gl54/` 就是这份源码。它和 4.19 路线**用的是完全不同的原语**：
+
+- 4.19 的 `p7` 走 punch（栈槽复用 + 伪 waiter），靠 `GL_*` 在运行时注入地址
+- 5.4 的 `ghostlock54` 走 futex PI 越界写拿到内核任意写，把目标进程的 cred 整体换成 `init_cred` 并清掉 seccomp；**偏移是编译期 `#define` 硬编码，不接受运行时注入**
+
+本项目在 54gay 这份源码上做了 A93（SM4350 / 5.4.254-qgki-g9ef4a332d496）适配，改动见 `_gl54/ghostlock54.c`：
+
+- 7 个 `OFF_*` 全部按 A93 的 OTA 内核重新标定
+- `task_reg` 从 x3/x26 改为 **x20**（A93 的 `proc_pid_status` 入口是 `mov x20, x3`）
+- futex 采样窗口从 `fun+0x80~fun+0x380` 收窄到 `fun~fun+0x8`，waiter 地址从 SP 改为 **`x29-40`**
+- `selinux_state` 从 perf 泄漏改为静态偏移（A93 的 `sel_read_enforce` 里 x8 不持有它）
+
+### 共同依赖
+
+- **[KernelSU](https://github.com/tiann/KernelSU)** — 内核侧实现与 4.14+ 兼容代码。`_gl54/kernelsu/` 是它的 5.4 适配副本，遵循 **GPL-3.0**
+- CVE-2026-43499 的公开分析 — 偏移标定方法参考
+
+> **两条路线的引擎不可互换**：`p7` 只认 4.19 的 `GL_*` 注入，`ghostlock54` 的偏移编译期就定死了（A93 版是单独标定的）。拿错引擎在别的内核上跑，轻则 insmod 失败，重则直接 panic。
 
 ## 许可
 
