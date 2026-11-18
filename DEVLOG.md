@@ -8,6 +8,65 @@
 
 ## 2026-11-18
 
+### Reno5 Pro（MTK 4.19.191）按设备树核对 — 量出 sizeof(struct module) = 960
+
+**做了什么**
+- 从用户给的 tarball 解出 MTK 内核树：`/home/dev/mt6889-kern`（1.4 GB，`VERSION=4 PATCHLEVEL=19 SUBLEVEL=191`）
+  - 仓库：`oppo-source/android_kernel_oppo_mt6889`，分支 `oppo/mt6889_t_13.1.0_reno5_pro`
+  - git clone 试了两次都失败（13min `early EOF` / 28min 超时），最终由用户手动下 tarball
+- 从 `ota/ren5p-Image` 的 `IKCFG` 段挖出设备 config（6117 行）
+- **实测 `sizeof(struct module) = 0x3c0 = 960`**（编译探针模块读出，不是猜的）
+
+**这是本次最重要的结论**
+
+| 对象 | sizeof(struct module) |
+|---|---|
+| **Reno5 Pro 实机（量出来的）** | **960 (0x3c0)** |
+| `kernelsu-mtk419-uapi5.ko`（现在的通用件） | **1024 (0x400)** |
+| `kernelsu-reno6pro-4.19.191.ko` | 1024 (0x400) |
+
+内核 `setup_load_info()` 里有一条硬检查：
+`sechdrs[index.mod].sh_size != sizeof(struct module)` → 直接 `-ENOEXEC`。
+**1024 ≠ 960，所以现有的通用 ko 在 Reno5 Pro 上必然装不上**，报错就是
+`insmod: failed to load ...: Exec format error`，且 dmesg 里什么都没有
+（还没走到 check_modinfo 就拒了）。
+
+**Reno5 Pro 的两个额外约束**
+1. `# CONFIG_KALLSYMS_ALL is not set` —— kallsyms 里只有函数，没有数据符号。
+   `ren5p.elf` 里实测：`selinux_state` / `init_task` / `init_cred` 全部 **0 命中**，
+   `kallsyms_lookup_name` / `module_layout` 命中。
+   → `kln` 那套只能查函数，改 `init_cred` 这类变量必须用档案里的硬编码偏移：
+   `GL_INITCRED=0x2109bb0`、`GL_SELINUX=0x277e218`、`GL_SIGENFORCE=0x2115fe0`
+2. `CONFIG_MODULE_SIG_FORCE=y`（Pad 也是）。但 Pad 上 22:15 那次 insmod 成功过，
+   而档案里有 `GL_SIGENFORCE` —— 说明 **p7 提权时会把 sig_enforce 清零**，
+   所以签名不是绝对阻塞，前提是 p7 先跑通。
+
+**交付：probe-ren5p-4.19.191.ko**（76 KB）
+一个只有 `char[sizeof(struct module)]` 的探针模块，vermagic 与设备**逐字一致**：
+`4.19.191+ SMP preempt mod_unload modversions aarch64`，0 个未定义符号。
+把它 insmod 上去，能加载就同时证明了三件事：vermagic 对、struct 大小对、p7 确实关了签名。
+
+**KSU 3.3.1 在 4.19 上编不过（已知）**
+卡在 `infra/file_wrapper.c`：`file_operations.remap_file_range`（4.20+）、
+`.iopoll`（5.1+）、`security_inode_init_security_anon`（5.8+）、`selinux_inode()`。
+这不是几处 `#if` 能绕的，属于要真实移植的量。已修掉前置的
+`nofault`/`pgtable`/`MODULE_IMPORT_NS`/`version.h` 顺序/`naked` 函数返回类型五处。
+
+**构建环境的坑（MTK 树比 sm8250 更多）**
+- 缺失 Kconfig 引用 **53 处**才收敛（sm8250 是 11 处），`.config` 6117 → 5916 行
+- `include/linux/sched_assist` 是个**指向 `vendor/oplus/kernel/...` 的断链**，
+  该目录在 `android_kernel_modules_and_devicetree_oppo_mt6889` 仓库里。
+  建实体目录 + 6 个空桩头解决
+- `CONFIG_LOCKING_PROTECT=y` 会让 `percpu-rwsem.h` 引用 `record_locking_info`，关掉
+- `flask.h` 不在 top-level make 的目标里，要手动编 `scripts/selinux/genheaders/genheaders`：
+  `classmap.h` 有 `#error New capability defined` 守卫（宿主头文件比 4.19 新），
+  得复制一份去掉那行再过 `-I` 指过去
+- `CONFIG_MODVERSIONS=y` 要求先 `make scripts` 生成 `genksyms`
+- tarball 没有 git 元数据，`utsrelease.h` 缺末尾的 `+`，
+  要手写 `include/config/kernel.release` 和 `UTS_RELEASE`
+
+---
+
 ### v7.9（69）— 新增 ADB 命令行接口
 
 **改了什么**
