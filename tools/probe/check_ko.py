@@ -97,6 +97,16 @@ def main():
             if p[2].startswith("__ksymtab_"):
                 exported.add(p[2][len("__ksymtab_"):])
 
+    # 直接把 boot.img 里抠出来的 Image 传进来时没有符号表，
+    # 改用「名字是否以明文出现在镜像里」判断 —— 导出符号名存在
+    # __ksymtab_strings，是明文；内部函数（kallsyms_lookup_name 之类）
+    # 名字在压缩的 kallsyms token 表里，搜不到属正常，不代表内核没有。
+    raw_mode = len(defined) == 0
+    if raw_mode:
+        print("    (目标没有符号表，改用镜像内字符串判断导出符号)")
+
+    if raw_mode:
+        defined = set()
     missing = [s for s in undef if s not in defined]
     # vmlinux-to-elf 对 4.19 恢复不全：数据符号和 __ksymtab_ 都可能没出来。
     # 兜底：导出符号的名字就存在 __ksymtab_strings 里，直接在 ELF 里搜字符串。
@@ -115,7 +125,7 @@ def main():
 
     # 4.19 的 kallsyms 不含 __ksymtab_ 符号（实测 Reno5 4.19.191 为 0 个），
     # 此时"是否导出"无从判断，只能报存在性 —— 否则会把好模块判成坏的。
-    can_check_export = len(exported) >= 100
+    can_check_export = (not raw_mode) and len(exported) >= 100
 
     print(f"\n[3] 未定义符号 {len(undef)} 个")
     if missing_as_string:
