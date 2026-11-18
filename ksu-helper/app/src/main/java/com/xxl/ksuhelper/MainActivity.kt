@@ -553,6 +553,22 @@ class MainActivity : ComponentActivity() {
         return res
     }
 
+    /** 5.4 专用引擎按**完整内核 release** 分版，不能只按大版本选。
+     *
+     *  已标定两份，符号地址互不通用：
+     *    g9ef4a332d496 → A93 / assets/ghostlock54       （368,440 B）
+     *    gaa96eae94d32 → Reno7 5G / PFJM10 → assets/ghostlock54-r7 （360,192 B，上游 v12.4）
+     *
+     *  拿错了不是"跑不通"这么温和：越界写原语会把 8 字节 0 写到错误的内核地址，
+     *  轻则 Oops，重则直接 panic 重启。所以未知 5.4 build 一律返回空串 → 走 fail-closed。
+     */
+    private fun fiveFourEngineAsset(): String = when {
+        !kernelVer.startsWith("5.4") -> "ghostlock54"
+        kernelVer == "5.4.254-qgki-gaa96eae94d32" -> "ghostlock54-r7"
+        kernelVer == "5.4.254-qgki-g9ef4a332d496" -> "ghostlock54"
+        else -> ""
+    }
+
     /** 本地 APK 完整性检查，不访问设备 shell，也不执行任何引擎。 */
     private fun missingPackagedAssets(): List<String> {
         val bundled = assets.list("")?.toSet().orEmpty()
@@ -560,9 +576,9 @@ class MainActivity : ComponentActivity() {
         // ko 已改为外置，不再打进 APK，因此这里不检查它；
         // 缺 ko 时由 bundledKo() 打印明确的放置指引。
         val required = listOf(
-            "p7", rk9Asset, "rkshd", "rksh", "ghostlock54",
+            "p7", rk9Asset, "rkshd", "rksh", fiveFourEngineAsset(),
             "probe.sh", "probe-perf", "ksucheck", "profiles.json"
-        )
+        ).filter { it.isNotEmpty() }
         return required.filter { it !in bundled }
     }
 
@@ -605,8 +621,8 @@ class MainActivity : ComponentActivity() {
         val pairs = listOf(
             "p7" to "p7", rk9Asset to "rk9.ko", "rkshd" to "rkshd", "rksh" to "rksh",
             // 5.4 专用引擎（源码级移植：fake lock 窗口 + rb_erase 越界写），
-            // 与 p7 是两条独立路线，按内核版本二选一
-            "ghostlock54" to "ghostlock54",
+            // 与 p7 是两条独立路线；5.4 内部再按完整 release 分 A93 / Reno7 两份
+            fiveFourEngineAsset() to "ghostlock54",
             // 只读探测件：不写内核、不提权、不烧 init_cred 预算
             "probe.sh" to "probe.sh",
             "probe-perf" to "probe-perf",
@@ -1224,10 +1240,17 @@ class MainActivity : ComponentActivity() {
     private suspend fun runGhostlock54(): Boolean = withContext(Dispatchers.IO) {
         busyLabel = "释放组件"
         log("== 1/4 释放 ghostlock54 ==")
+        val engineAsset = fiveFourEngineAsset()
+        log("  内核 $kernelVer → 引擎 $engineAsset")
+        if (engineAsset.isEmpty()) {
+            log("  !! 这个 5.4 build 没有标定过引擎（已有 A93 g9ef4a332d496 / Reno7 gaa96eae94d32）")
+            log("     拿别的机型引擎硬跑会把 8 字节 0 写到错误地址 → Oops/panic，已拒绝执行")
+            return@withContext false
+        }
         val dir = extractAssets()
         val bin = File(dir, "ghostlock54")
         log("  ${bin.absolutePath} (${bin.length()} 字节)")
-        // 阈值必须低于真实体积。A93 版编出来是 368,576 B（STRIP=1，含精简 ko），
+        // 阈值必须低于真实体积。A93 版 368,440 B / Reno7 v12.4 360,192 B（都含精简 ko）。
         // 之前写成 500_000 会让 5.4 路径在这里直接 return false —— 漏洞根本不执行。
         if (!bin.exists() || bin.length() < 300_000) {
             log("  !! ghostlock54 提取失败"); return@withContext false

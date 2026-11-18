@@ -8,6 +8,111 @@
 
 ## 2026-11-18
 
+### OPPO Pad 实机验证（20:00~20:40）— 模块是空壳，管理器版本也不对
+
+**现场结果**
+
+| 项 | 值 |
+|---|---|
+| 隧道 | VPS 27790 单监听（清掉两个僵尸会话后恢复正常） |
+| 设备 | OPD2101 / Android 14 / 内核 `4.19.157-perf+` |
+| 提权 | p7 成功：`scontext=u:r:kernel:s0`、`Uid: 0`、`selinux enforce=0` |
+| root 通道 | `/data/local/tmp/rksh -c 'id'` → `uid=0(root)`，`Seccomp: 0`（无过滤器） |
+| ko 加载 | `insmod` / `ksud insmod` 都 `RC=0`，`kernelsu 143360 0 - Live` |
+
+**但 supercall 完全不通**
+
+```
+$ ksud feature check adb_root
+Caused by: could not retrieve kernelsu driver fd
+$ ksud feature get su_compat
+Caused by: could not retrieve kernelsu driver fd
+```
+
+跑这个的是 **uid 0 + Seccomp 0** 的进程，所以不是权限、不是 seccomp。
+
+**排除了的错误方向**
+
+| 假设 | 实测 |
+|---|---|
+| `sizeof(struct module)` 不匹配 | **错**。用 Pad 的树编探针实测 = **832**，与 ko 完全一致 |
+| vermagic 不匹配 | **错**。逐字相同 |
+| kln 传错地址 | **错**。传 `0xffffff924679e718` = 实际 `T kallsyms_lookup_name` |
+| 模块参数名不对 | **错**。`llvm-nm | grep __param` 显示确有 `kln`（还有 allow_shell/block_modules/bundled/enforce_after/force_feature/level/norc） |
+| 这棵树编出来的模块跑不起来 | **错**。同 config 编的 `probe.ko`（`char[sizeof(struct module)]`）`insmod RC=0`，`probe 16384 0 - Live` |
+
+**关键线索：ko 里带 ksu54 代码**
+
+```
+KernelSU: ksu54: level=%d, skip dispatcher install
+KernelSU: patch syscall %d failed
+```
+
+这个 ko 来自 5.4 的移植分支（`ksu54`），只是拿去用 4.19 头文件编了一遍。
+它的 hook 靠「patch syscall 表 / 装 dispatcher」，在 4.19.157 上这一步显然失败了，
+所以模块 `Live` 但没有任何入口。
+
+**管理器侧另一个问题**
+
+用户提供的「他们的管理器」APK，实测 sha256 与本机已装的那份**完全相同**：
+`me.weishu.kernelsu` 32715 / `v3.3.1-35-gbec9c134`。
+
+但用户截图里能用的那台（OPPO A2x，4.19.191+）显示：
+
+```
+工作中 [越狱模式]
+版本：32715-6
+管理器版本 v3.3.1-47-gdbb73665 (32727-6)
+```
+
+**管理器是 32727，不是 32715。** 32715 打开只显示「不支持 / KernelSU 现在只支持 GKI 内核」——
+它对非 GKI 的 LKM 模式（越狱模式）没有处理逻辑。
+
+**结论**
+
+要复现别人的成功，两样都得对：
+1. **ko 必须是为这颗内核真正移植过的**（不是 5.4 分支套 4.19 头）
+2. **管理器要 32727 或更新的**（32715 不识别越狱模式）
+
+**顺带清掉的残留**
+`/data/local/tmp/kernelsu.ko` 是 13:19 那个 238,760 字节的 strip 版，已确认不是这次加载的文件；
+这次实际用的是 `/sdcard/Download/kernelsu.ko`（4,195,232 字节原始版）。
+
+---
+
+### v8.0（70）— 5.4 引擎按完整内核 release 分版，加入 Reno7 / PFJM10 引擎
+
+**改了什么**
+- 新增资源 `assets/ghostlock54-r7`（360,192 B，md5 `953a8449b1d8ad2c897ef2085c97e499`），
+  即上游 `54gay/ghostlock54-OPPO-Reno7-5G` v12.4 的单文件二进制
+- `MainActivity.kt` 新增 `fiveFourEngineAsset()`，按**完整内核 release** 选 5.4 引擎：
+  `5.4.254-qgki-gaa96eae94d32` → `ghostlock54-r7`；`5.4.254-qgki-g9ef4a332d496` → `ghostlock54`；
+  其它 5.4 build → 返回空串，`runGhostlock54()` 直接拒绝执行
+- `missingPackagedAssets()` / `extractAssets()` 改用这个选择器，不再无条件要 `ghostlock54`
+- 版本 7.9(69) → 8.0(70)
+
+**为什么**
+之前 5.4 分支只按 `kernelVer.startsWith("5.4")` 二选一，包内只有 A93（g9ef4）那一份引擎。
+拿它跑 Reno7（gaa96）不是"跑不通"这么温和 —— 越界写原语会把 8 字节 0 写到按 A93 算出来的
+内核地址上，轻则 Oops，重则 panic 重启。两个 build 的 `init_cred`（0x2caf850 vs 实测一致）
+和 `futex_wait_requeue_pi` 等地址虽然这次核对下来相同，但**不能靠这个巧合过日子**：
+只要任何一次 OTA 换了内核，两机型就会分叉，必须靠 release 串严格区分。
+
+**怎么验证的**
+- 从 `PFJM10_11.F.74` 全量包只取 boot（Range，192 MB），`IKCFG` 解出真实 config 7108 行，
+  `vmlinux-to-elf` 从 Image 重建 189,534 个 kallsyms 符号，逐条核对上游 `ghostlock54.c` 的 8 个常量：
+  `_text` / `init_task` / `init_cred` / `selinux_state` / `futex_wait_requeue_pi` /
+  `sel_read_enforce` 全部 0 偏差，`OFF_LOG_BUF` 落 `.bss`、`OFF_TASK_STATE` 落 `.text`
+  ⇒ 新固件的内核与上游 v12.4 的目标内核是同一份，二进制可直接用
+- `aapt2 dump badging`：versionCode 70 / versionName 8.0；APK 内 `assets/ghostlock54-r7`
+  md5 与校验过的上游产物一致
+
+**没验证的**
+- 没有 PFJM10 真机，没跑过一次完整提权；APK 只验证了编译、打包、资源完整性。
+- 用户态唯一风险点仍是 `perf_event_paranoid`（需 ≤2），`probe.sh` 里已采集，上机先看这一项。
+
+---
+
 ### Reno5 Pro（MTK 4.19.191）按设备树核对 — 量出 sizeof(struct module) = 960
 
 **做了什么**

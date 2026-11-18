@@ -11,8 +11,8 @@ android {
         applicationId = "com.xxl.ksuhelper"
         minSdk = 26
         targetSdk = 37
-        versionCode = 69
-        versionName = "7.9"
+        versionCode = 70
+        versionName = "8.0"
     }
 
     buildTypes {
