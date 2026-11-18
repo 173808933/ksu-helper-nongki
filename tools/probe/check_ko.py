@@ -98,27 +98,52 @@ def main():
                 exported.add(p[2][len("__ksymtab_"):])
 
     missing = [s for s in undef if s not in defined]
+    # vmlinux-to-elf 对 4.19 恢复不全：数据符号和 __ksymtab_ 都可能没出来。
+    # 兜底：导出符号的名字就存在 __ksymtab_strings 里，直接在 ELF 里搜字符串。
+    _blob = None
+    def _name_present(name):
+        nonlocal _blob
+        if _blob is None:
+            with open(elf, "rb") as fh:
+                _blob = fh.read()
+        return name.encode() in _blob
+    still_missing = [x for x in missing if not _name_present(x)]
+    missing_as_string = [x for x in missing if _name_present(x)]
+    missing = still_missing
     notexp = [s for s in undef if s not in exported and s not in missing]
     ok = len(undef) - len(missing) - len(notexp)
 
+    # 4.19 的 kallsyms 不含 __ksymtab_ 符号（实测 Reno5 4.19.191 为 0 个），
+    # 此时"是否导出"无从判断，只能报存在性 —— 否则会把好模块判成坏的。
+    can_check_export = len(exported) >= 100
+
     print(f"\n[3] 未定义符号 {len(undef)} 个")
+    if missing_as_string:
+        print(f"    (符号表未恢复、但字符串在 ELF 内 : {len(missing_as_string)} —— 视作已导出)")
     print(f"    内核里不存在 : {len(missing)}")
     for s in missing[:10]:
         print("       MISSING      ", s)
-    print(f"    存在但未导出 : {len(notexp)}")
-    for s in notexp[:10]:
-        print("       NOT-EXPORTED ", s)
-    print(f"    可直接使用   : {ok}")
+    if can_check_export:
+        print(f"    存在但未导出 : {len(notexp)}")
+        for s in notexp[:10]:
+            print("       NOT-EXPORTED ", s)
+        print(f"    可直接使用   : {ok}")
+    else:
+        print(f"    (该内核符号表无 __ksymtab_ 标记，跳过「是否导出」判断)")
+        print(f"    符号存在性可用 : {len(undef) - len(missing)}")
 
     print("\n" + "=" * 60)
     verdict = []
     verdict.append("vermagic 需手动核对内核版本" if vm else "vermagic 缺失")
     if has_vs and vs_size == 0:
         verdict.append("空 __versions 会导致加载失败")
-    if missing or notexp:
-        verdict.append("有符号无法解析，insmod 会报 Unknown symbol")
-    if len(verdict) == 1 and not missing and not notexp:
-        print("结论：符号层面可以加载（vermagic 与空段两项需人工确认后再试）")
+    if missing:
+        verdict.append(f"{len(missing)} 个符号在内核里不存在，insmod 会报 Unknown symbol")
+    elif can_check_export and notexp:
+        verdict.append(f"{len(notexp)} 个符号未导出，insmod 会报 Unknown symbol")
+    blocked = bool(missing) or (can_check_export and bool(notexp))
+    if not blocked and not (has_vs and vs_size == 0):
+        print("结论：未发现阻断性证据（vermagic 仍需与内核版本人工核对）")
     else:
         print("结论：", "；".join(verdict))
     return 0

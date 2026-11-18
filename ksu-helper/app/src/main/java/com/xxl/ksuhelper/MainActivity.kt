@@ -550,10 +550,13 @@ class MainActivity : ComponentActivity() {
     private fun missingPackagedAssets(): List<String> {
         val bundled = assets.list("")?.toSet().orEmpty()
         val rk9Asset = if (kernelVer.startsWith("5.4")) "rk9-54.ko" else "rk9.ko"
+        // 当前机型对应的内置 ko 也必须存在，否则 pickBundledKo() 返回的名字
+        // 在 APK 里查不到，装载会在 assets.open() 处才炸
+        val bundledKoAsset = pickBundledKo()?.asset
         val required = listOf(
             "p7", rk9Asset, "rkshd", "rksh", "ghostlock54",
             "probe.sh", "probe-perf", "ksucheck", "profiles.json"
-        )
+        ) + listOfNotNull(bundledKoAsset)
         return required.filter { it !in bundled }
     }
 
