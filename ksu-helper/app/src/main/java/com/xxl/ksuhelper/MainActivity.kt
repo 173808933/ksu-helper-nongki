@@ -1378,7 +1378,17 @@ class MainActivity : ComponentActivity() {
             //   level=3 让模块把详细日志打到 kmsg。
             val kln = sh("grep ' kallsyms_lookup_name$' /proc/kallsyms 2>/dev/null | head -1 | cut -d' ' -f1", 15).out.trim()
             val klnArg = if (kln.length > 8 && kln != "0000000000000000") " kln=0x$kln" else ""
-            log("  kln=${if (klnArg.isEmpty()) "未取到（符号解析可能失败）" else "0x$kln"}")
+            if (klnArg.isEmpty()) {
+                // 模块不内建 kallsyms 表，符号全靠这个地址去查。
+                // 没传 kln 时 insmod 仍会成功、/proc/modules 也有 kernelsu，
+                // 但所有 kallsyms_lookup_name 返回 0 —— su / allowlist 全部静默失效，
+                // 表面看「模块加载了」，实际是个空壳。宁可不装，也不要假装成功。
+                log("  !! 取不到 kallsyms_lookup_name 地址（kptr_restrict=2 或权限不足）")
+                log("     ko 靠 kln 传这个地址来解析全部内核符号，没有它就只是个空壳模块。")
+                log("     已中止 insmod —— 先解决 kallsyms 读取，别继续往下走。")
+                return
+            }
+            log("  kln=0x$kln")
             val ins = sh("/data/local/tmp/rksh -c 'insmod $ko$klnArg level=3; echo RC=\$?' 2>&1", 180)
             log("  insmod ${System.currentTimeMillis() - t0}ms  ${ins.out.trim().replace("\n", " | ")}")
             val mods = sh("cat /proc/modules 2>/dev/null | grep '^kernelsu' || echo none", 20).out.trim()
@@ -1671,6 +1681,10 @@ class MainActivity : ComponentActivity() {
                 val t = System.currentTimeMillis()
                 val kln2 = sh("grep ' kallsyms_lookup_name$' /proc/kallsyms 2>/dev/null | head -1 | cut -d' ' -f1", 15).out.trim()
                 val klnArg2 = if (kln2.length > 8 && kln2 != "0000000000000000") " kln=0x$kln2" else ""
+                if (klnArg2.isEmpty()) {
+                    log("!! 取不到 kallsyms_lookup_name，中止 insmod（没有 kln 的模块是空壳）")
+                    return@withContext
+                }
                 val ins = sh("/data/local/tmp/rksh -c 'insmod /data/local/tmp/kernelsu.ko$klnArg2 level=3' 2>&1", 90)
                 log("insmod exit=${ins.code} ${System.currentTimeMillis() - t}ms")
                 log(ins.out.trim().ifBlank { "(无输出)" })

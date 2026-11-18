@@ -90,6 +90,33 @@ echo "--- 已加载模块（看有没有 rk9/kernelsu 残留，或厂商反作�
 cat /proc/modules 2>/dev/null | sed 's/^/  /' | head -30
 
 echo
+echo "--- KALLSYMS_ALL 判定（决定 ko 能不能查到数据符号）---"
+# ko 不内建 kallsyms 表，全靠 kln 传进来的 kallsyms_lookup_name 去查。
+# 若内核只导函数（KALLSYMS_ALL=n），查 selinux_state / init_task 这类数据符号会返回 0，
+# 模块能 insmod 成功但所有功能静默失效。
+KLN_A=$(grep -E " [Tt] kallsyms_lookup_name$" /proc/kallsyms 2>/dev/null | head -1 | cut -d' ' -f1)
+if [ -n "$KLN_A" ] && [ "$KLN_A" != "0000000000000000" ]; then
+    echo "  kallsyms_lookup_name = 0x$KLN_A  （可传给 insmod kln=）"
+else
+    echo "  kallsyms_lookup_name = 读不到 —— 模块将无法解析符号"
+fi
+DATA_HIT=0
+for d in selinux_state init_task init_cred; do
+    da=$(grep -w " $d$" /proc/kallsyms 2>/dev/null | head -1 | cut -d' ' -f1)
+    if [ -n "$da" ] && [ "$da" != "0000000000000000" ]; then
+        echo "  数据符号 $d 在表内 ✓"
+        DATA_HIT=$((DATA_HIT+1))
+    else
+        echo "  数据符号 $d 不在表内 ✗"
+    fi
+done
+if [ "$DATA_HIT" -eq 3 ]; then
+    echo "  → KALLSYMS_ALL=y，ko 可以正常解析"
+else
+    echo "  → 疑似 KALLSYMS_ALL=n：模块会加载成功但功能失效"
+fi
+
+echo
 echo "--- 栈保护 / PAC 相关（影响模块能否加载）---"
 if [ -r /proc/kallsyms ]; then
     grep -cE " (__stack_chk_guard|__arm64_ssbd_start_mitigation)$" /proc/kallsyms 2>/dev/null \
