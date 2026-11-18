@@ -80,9 +80,12 @@ def main():
     if not has_vs:
         print("[2] __versions: 不存在 → 内核 check_version 直接放行 ✓")
     elif vs_size == 0:
-        print("[2] __versions: 存在但为 0 字节 → 加载会报 "
-              "\"no symbol version for module_layout\"  ✗")
-        print("    修: llvm-objcopy --remove-section=__versions <ko>")
+        # 实测 kernel/module.c 的 check_version()：
+        #   pr_warn_once("no symbol version for %s"); return 1;   ← 只是警告，放行
+        # 所以空段不会阻止加载。**不要**为了「修」这个去 strip/删段，
+        # 那样反而会破坏 ELF 让 elf_validity_check 返回 ENOEXEC。
+        print("[2] __versions: 存在但为 0 字节 → 内核只 pr_warn_once 然后放行 ✓")
+        print("    （工具链不完整，但可以加载；不要为此删段）")
     else:
         print(f"[2] __versions: {vs_size} 字节（有 CRC 表，需与目标内核一致）")
 
@@ -152,7 +155,7 @@ def main():
     elif can_check_export and notexp:
         verdict.append(f"{len(notexp)} 个符号未导出，insmod 会报 Unknown symbol")
     blocked = bool(missing) or (can_check_export and bool(notexp))
-    if not blocked and not (has_vs and vs_size == 0):
+    if not blocked:
         print("结论：未发现阻断性证据（vermagic 仍需与内核版本人工核对）")
     else:
         print("结论：", "；".join(verdict))

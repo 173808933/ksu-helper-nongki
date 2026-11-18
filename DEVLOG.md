@@ -1,0 +1,159 @@
+# 开发日志
+
+> **规则**：每次改动追加在顶部，写清「改了什么 / 为什么改 / 怎么验证的 / 结论对不对」。
+> 特别是**错误的判断**必须记下来 —— 那是花时间最多的地方。
+> 版本号对应 `app/build.gradle.kts` 的 `versionCode`。
+
+---
+
+## 2026-11-18
+
+### v7.6（versionCode 66）— 回滚 ko 的 strip/删段
+
+**改了什么**
+- `assets/kernelsu-qcom157-uapi5.ko`、`mtk419`、`sm7325` 全部换回 `modules/` 下的**原始文件**（未 strip、未删段）
+- `assets/rk9-54.ko` 恢复原始 216,904 B，只把 vermagic 字符串 `gaa96` 改成 `g9ef4`
+- `tools/probe/check_ko.py` 纠正「空 `__versions` 会拒绝加载」的错误结论
+
+**为什么改（这是我今天的错误）**
+
+v7.3 时我认为「`__versions` 段存在但为 0 字节」会让内核报 `no symbol version for module_layout` 并拒绝加载，
+于是对所有 ko 做了 `strip --strip-debug` + `llvm-objcopy --remove-section=__versions`。
+
+实机结果：`insmod: failed to load ...: Exec format error`，dmesg 里连一条记录都没有。
+
+后来直接读源码（`/home/dev/sm8250-kern/kernel/module.c`）才看到真相：
+
+```c
+static int check_version(...)
+{
+    if (versindex == 0)
+        return try_to_force_load(mod, symname) == 0;
+
+    num_versions = sechdrs[versindex].sh_size / sizeof(struct modversion_info);
+    for (...) { ... }
+
+    /* Broken toolchain. Warn once, then let it go.. */
+    pr_warn_once("%s: no symbol version for %s\n", info->name, symname);
+    return 1;        // ← 放行！
+}
+```
+
+**空 `__versions` 只是 `pr_warn_once`，然后返回 1 放行**。模块照常加载。
+
+而 `strip` + `objcopy` 这两步把 ELF 结构弄坏了 —— `elf_validity_check()` 返回 `ENOEXEC`，
+所以 dmesg 里什么都没有（内核在读 ELF 头时就拒了，还没到 `check_modinfo`）。
+
+**验证**
+- `check_ko.py` 对原始文件：157 个符号全部命中，`__versions` 0 字节但不再判定为阻断
+- v7.6 换回原始文件后待实机验证
+
+**教训**
+> 涉及内核行为，**先读源码再下结论**。我对 `check_version` 的记忆是错的，
+> 而且没有先去 `kernel/module.c` 确认就批量改了 5 个文件。
+
+---
+
+### v7.5（65）— dmesg 关键词扩充
+
+**改了什么**：`dmesgKsu()` 的关键词加上 `version magic|ELF structures|unknown symbol|disagrees about|invalid module|module verification|taints kernel`。
+
+**为什么**：insmod 失败时最有用的那行 `module has invalid ELF structures` 不含原来的任何关键词，被 grep 过滤掉了，日志显示「dmesg 里没有 kernelsu 相关记录」——误导排查方向。
+
+---
+
+### v7.4（64）— kptr_restrict 导致 kln 读不到
+
+**改了什么**：两处 insmod 前先用 `rksh` 把 `/proc/sys/kernel/kptr_restrict` 降到 0，再读 `kallsyms_lookup_name`；`grep` 限定 ` T ` 类型。
+
+**为什么**：实机日志（OPPO Pad）显示提权成功（`uid=0(root)`），但 `kln` 为空。
+
+根因：`kptr_restrict=2` 时只有带 `CAP_SYSLOG` 的进程能读到真实地址，而 `kln` 是用 `sh()` 读的
+—— **`sh()` 走 Shizuku 的 shell 通道，uid 恒为 2000**，即使前面 `rksh` 已经拿到 uid=0，
+读取这一步仍是 shell 在跑。
+
+**验证**：v7.4 实机日志 `kptr_restrict -> 0`、`kln=0xffffffa2cf79e718` —— 拿到了。
+
+---
+
+### v7.3（63）— 补齐内置 ko（但处理方式错了，见 v7.6）
+
+**改了什么**：把 `modules/` 下的 ko 复制进 `assets/`，并纳入 `missingPackagedAssets` 检查。
+
+**背景**：`pickBundledKo()` 返回 `kernelsu-qcom157-uapi5.ko`，但这个文件**不在 APK 里**，
+`bundledKo()` 会在 `assets.open()` 处抛异常 —— 内置 ko 这条路一直是断的，
+4.19 机型全靠 `/sdcard/Download` 兜底。
+
+**错误**：同时做了 strip + 删段（见 v7.6）。
+
+---
+
+### v7.2（62）— 合并 6.1sol 的 fail-closed 改动
+
+**改了什么**
+- `matchesKernelRelease`：vermagic 必须与 `uname -r` **完整相等**（原来 `vm==null` 放行 + 双向 `startsWith`）
+- `isRootIdentity`：`uid=0` 整词匹配 + 退出码为 0
+- `missingPackagedAssets` + `auditPackagedAssets` + UI 按钮
+- `startRoot` 三态结果：`ok` 只代表引擎没报错，root 另需 `checkRoot` 核验
+- 新增 `DiagnosticValidationTest`（8 例）
+
+**为什么**：原逻辑会把 `5.4.254` 当成匹配 `5.4.254-qgki-g9ef4…`（拿错 ko 会 panic）；
+`euid=0`、`uid=00`、超时输出里的残留 `uid=0` 都会误判为 root。
+
+**验证**：8 tests / 0 failures。
+
+---
+
+### v7.1（61）— 5.4 路径不走 autoKsuSetup
+
+**改了什么**：`runGhostlock54()` 成功后只调 `verifyKsu()`，不再调 `autoKsuSetup()`。
+
+**为什么**：`autoKsuSetup()` 里所有 root 操作都走 `/data/local/tmp/rksh`，
+而 rksh 依赖 rkshd + rk9.ko，**gl54 不会启动 rkshd** —— 5.4 上根本没有 root shell。
+（v7.0 时我把 5.4 接进 autoKsuSetup 是错的。）
+
+---
+
+### v7.0（60）— kln 为空时中止 insmod
+
+**改了什么**：两处 insmod 前，`kln` 取不到就 `return`，不装模块。
+
+**为什么**：模块不内建 kallsyms 表，符号解析全靠 `kln` 传入的 `kallsyms_lookup_name`。
+没传 kln 时 `insmod` 仍会成功、`/proc/modules` 也有 `kernelsu`，
+但所有 `kallsyms_lookup_name` 返回 0 —— su / allowlist 全部静默失效，是**空壳模块**。
+
+---
+
+## 关键结论（已验证）
+
+| 主题 | 结论 |
+|---|---|
+| OPPO Pad 内核 | `4.19.157-perf+`，`CONFIG_KALLSYMS_ALL=y`、`MODVERSIONS=y`、`MODULE_SIG=y`，**无 CFI / 无 PAC** |
+| Pad 的 `sizeof(struct module)` | 期望值未知（原始 qcom157 的 ko 是 **832**，但加载失败，见下） |
+| `kallsyms_lookup_name` | Pad 内核里有；`kptr_restrict=2` 时必须先降到 0 才能读 |
+| 空 `__versions` 段 | **只是 warning，内核放行** —— 不要为此 strip/删段 |
+| 提权 | p7 在 Pad 上稳定成功（`uid=0(root)`，第 6s 就绪） |
+| allowlist | 走 `pushFile` 的 stdin 兜底能成功写入 1576 字节 |
+| 22:15 那次 `insmod RC=0` | 用的是 `/sdcard/Download/kernelsu.ko`，**不是**内置的 |
+
+## 待查
+
+1. **`sizeof(struct module)` 到底该是多少**：原始 qcom157 是 832，仍 `ENOEXEC`。
+   需要 `adb pull /sdcard/Download/kernelsu.ko` 量一下那个能加载的值。
+2. 内核源码树在 `/home/dev/sm8250-kern`（1.2 GB，`oppo/sm8250_u_14.0.0_oslo`），
+   config 是 `/tmp/pad-config.txt`（从 `boot.img` 的 `IKCFG` 挖出，6687 行）。
+   **`make modules_prepare` 因 `asm-offsets.s` 失败而未完成**，但 `timeconst.h` / `bounds.h` / `autoconf.h` 都已生成。
+3. KSU 官方 v3.3.1 与 4.19 不兼容（`nofault` API、`MODULE_IMPORT_NS`、`security/selinux/include/flask.h`），
+   需要非 GKI fork 才能编出 4.19 版。
+
+## 构建环境的坑（一次性记录）
+
+- OPPO sm8250 主仓库的 Kconfig 有 **11 处**指向 `android_kernel_modules_and_devicetree_oppo_sm8250` 的断链
+  （`kernel/sched_assist`、`block/blk`、`drivers/soc/oplus` 等）。
+  **不要批量按路径存在性注释** —— `source` 路径是相对当前 Kconfig 目录的，批量处理会把
+  `drivers/`、`fs/`、`net/` 一起切断，`.config` 从 6687 行掉到 636 行。
+  正确做法：跑 `make syncconfig`，报错就**只注释报错的那一行**，迭代到收敛。
+- 内核脚本调用 `python`（不是 `python3`），Ubuntu 22.04 需要建软链。
+- `scripts/gcc-wrapper.py` 是 Python 2 语法（`print "x"`）且 `subprocess` 返回 bytes，
+  需 `2to3` + `universal_newlines=True`。
+- `CONFIG_LOCKING_PROTECT=y`（OPPO 私有）会让 `percpu-rwsem.h` 依赖 `sched_assist_locking.h`，编译模块前关掉。

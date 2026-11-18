@@ -1299,8 +1299,14 @@ class MainActivity : ComponentActivity() {
      *  直接 `dmesg | tail -25` 会被 ColorOS 的 ipv6_rto / charger 日志整段淹没，
      *  模块 init 时那几行 allowlist / manager 判定在几千行之前就刷没了。 */
     private fun dmesgKsu(): String {
+        // 关键词要覆盖内核拒绝模块时的原始报错，否则最有用的那行会被过滤掉：
+        //   "module has invalid ELF structures"（sizeof(struct module) 不符）
+        //   "version magic ... should be ..."（vermagic 不符）
+        //   "disagrees about version of symbol"（modversions CRC 不符）
         val r = sh("/data/local/tmp/rksh -c 'dmesg | grep -iE " +
-                "\"allowlist|load_allow|kernelsu|Searching manager|is_manager|manager uid|reboot kprobe\" " +
+                "\"allowlist|load_allow|kernelsu|Searching manager|is_manager|manager uid|" +
+                "reboot kprobe|version magic|ELF structures|unknown symbol|disagrees about|" +
+                "invalid module|module verification|taints kernel\" " +
                 "| tail -25' 2>&1", 50)
         val t = r.out.trim()
         return if (t.isBlank()) "(dmesg 里没有 kernelsu 相关记录)" else t
