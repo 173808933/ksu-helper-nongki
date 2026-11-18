@@ -141,10 +141,17 @@ class MainActivity : ComponentActivity() {
     private val RUN_LOG_REMOTE = "/data/local/tmp/p7run.log"
 
     /** /proc/sys/kernel/random/boot_id 世界可读，App 不需要任何权限 */
+    /** 读本次开机的 boot_id。读不到 / 格式不对时返回空串。
+     *
+     *  不要用 "-" 之类的哨兵：.glhold 里存的是 UUID，**本身含连字符**，
+     *  一旦拿 "-" 去 contains 就恒真，会让设备在之后每次开机都判定
+     *  「本次已跑过」而永久拒绝执行（必须重启+清文件才能恢复）。 */
     private fun bootId(): String = try {
-        File("/proc/sys/kernel/random/boot_id").readText().trim()
+        val v = File("/proc/sys/kernel/random/boot_id").readText().trim()
+        val uuid = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        if (uuid.matches(v)) v else ""
     } catch (e: Throwable) {
-        "-"
+        ""
     }
     private var pendingAuto: String? = null
 
@@ -661,7 +668,14 @@ class MainActivity : ComponentActivity() {
      */
     private fun bundledKo(b: BundledKo): File? {
         val f = File(getExternalFilesDir(null), "ko/${b.asset}")
-        if (f.exists() && f.length() > 0L) return f
+        // 必须校验大小：v7.3~v7.5 曾把 strip 过的坏 ko 释放到这个路径，
+        // 只判 exists 会让坏文件被永久复用 —— 换回正确 ko 的版本在真机上根本不生效。
+        val expectLen = try { assets.openFd(b.asset).length } catch (_: Throwable) { -1L }
+        if (f.exists() && f.length() > 0L) {
+            if (expectLen <= 0L || f.length() == expectLen) return f
+            log("  ko 缓存大小不符（本地 ${f.length()} / APK $expectLen），重新释放")
+            f.delete()
+        }
         return try {
             f.parentFile?.mkdirs()
             assets.open(b.asset).use { i ->
@@ -740,8 +754,12 @@ class MainActivity : ComponentActivity() {
      *  重启并不会清空它 —— 所以标记里必须写 boot_id，靠它判断是否同一轮开机。
      */
     private fun alreadyExploitedThisBoot(): Boolean {
-        val want = bootId().trim()
-        if (want.isBlank() || want == "未知") return false
+        val want = bootId()
+        if (want.isEmpty()) {
+            // 判不了就按「没跑过」放行 —— 宁可让用户重试，也不要把他锁死在「已跑过」上
+            log("  ! 读不到 boot_id，无法判断本次开机是否跑过（按未跑过处理）")
+            return false
+        }
         val got = sh("cat /data/local/tmp/.glhold 2>/dev/null || echo NONE", 10).out.trim()
         return got.contains(want)
     }
@@ -1036,7 +1054,14 @@ class MainActivity : ComponentActivity() {
         // 模块已在位说明内核侧没必要再动，直接走装载/校验
         if (sh("[ -d /sys/module/kernelsu ] && echo Y || echo N", 10).out.contains("Y")) {
             log("  kernelsu 模块已在位（/sys/module/kernelsu 存在），跳过漏洞直接校验")
-            if (autoKsu) autoKsuSetup()
+            // 5.4 上没有 rksh（rkshd 不会被 gl54 启动），autoKsuSetup 里全是 rksh 调用，
+            // 走进去只会刷一屏失败。分叉处理。
+            if (kernelVer.startsWith("5.4")) {
+                if (autoKsu) log("  ! 5.4 无 root shell，跳过 ksud/allowlist（需 rk9 适配）")
+                verifyKsu()
+            } else if (autoKsu) {
+                autoKsuSetup()
+            }
             return@withContext true
         }
         try {
@@ -1117,6 +1142,9 @@ class MainActivity : ComponentActivity() {
             log("  env $env")
             log("  p7 输出 -> $RUN_LOG_REMOTE（/data 分区；每 2s sync 一次 + 复制到 App 目录）")
             log("  注意：panic 时 f2fs 会回滚，不 sync 的话最后几十秒的日志会整个消失")
+            // ★ 先写标记再执行。init_cred.usage 只有 4 格，而「跑失败了」同样扣一格 ——
+            //   只在成功后写标记，等于「最多成功一次、失败不限次」，连点四次就把内核扣崩。
+            markExploited()
             val t3 = System.currentTimeMillis()
             val run = sh(
                 "rm -f $RUN_LOG_REMOTE; cd /data/local/tmp && " +
@@ -1218,16 +1246,25 @@ class MainActivity : ComponentActivity() {
 
         busyLabel = "推送"
         log("== 2/4 推送到 /data/local/tmp ==")
-        val push = sh("cp -f '${bin.absolutePath}' /data/local/tmp/ghostlock54 && " +
-                "chmod 755 /data/local/tmp/ghostlock54 && ls -l /data/local/tmp/ghostlock54", 60)
-        log("  ${push.out.trim()}")
-        if (!push.out.contains("ghostlock54")) { log("  !! 推送失败"); return@withContext false }
+        // 不能用 contains("ghostlock54") 判断成功：失败的 cp 报错里本身就带这个文件名，
+        // 判定会永远通过，后面 nohup 找不到文件却照样 echo submitted，空转满 75s。
+        val push = sh("cp -f '${bin.absolutePath}' /data/local/tmp/ghostlock54 2>&1 && " +
+                "chmod 755 /data/local/tmp/ghostlock54 2>&1 && " +
+                "echo size=$(wc -c < /data/local/tmp/ghostlock54 2>/dev/null)", 60)
+        val remoteLen = Regex("size=(\\d+)").find(push.out)?.groupValues?.get(1)?.toLongOrNull() ?: -1L
+        log("  远端 ${remoteLen} B / 本地 ${bin.length()} B")
+        if (remoteLen != bin.length() || !sh("[ -x /data/local/tmp/ghostlock54 ] && echo Y", 10).out.contains("Y")) {
+            log("  !! 推送失败：${push.out.trim().take(160)}")
+            return@withContext false
+        }
 
         busyLabel = "执行漏洞"
         log("== 3/4 执行（提权 + 加载 KernelSU，约 30~60s）==")
         sh("rm -f /data/local/tmp/gl54.log", 10)
         // 默认模式：父进程会 daemonize 并原地挂起保活
         // （exploit 成功后内核 PI 引用指向存活线程的栈，进程退掉会 panic）
+        // 同 p7：执行前就落标记，失败也算消耗过预算
+        markExploited()
         val run = sh("cd /data/local/tmp && nohup ./ghostlock54 > gl54.log 2>&1 & " +
                 "sleep 3; echo submitted", 40)
         log("  ${run.out.trim()}")
@@ -1537,7 +1574,15 @@ class MainActivity : ComponentActivity() {
         }
         sh("chmod 755 /data/local/tmp/ksucheck 2>/dev/null", 15)
         log("  --- ksucheck：向内核确认 supercall 与 allowlist ---")
-        log(sh("/data/local/tmp/ksucheck 2>&1", 60).out.trimEnd())
+        val chkOut = sh("/data/local/tmp/ksucheck 2>&1", 60).out.trimEnd()
+        log(chkOut)
+        // ksucheck 是用 App 自己的 uid 跑的（Shizuku shell 通道是 2000），
+        // 而 allowlist 只写 Manager 和本 App 的 uid —— GRANT_ROOT 必然 EPERM。
+        // 这是**预期**，不能当成「提权失败」，否则会把正常的模块读成坏的。
+        if (chkOut.contains("GET_INFO ✓")) {
+            log("  → supercall 已通（模块在工作）。GRANT_ROOT 若失败属预期：")
+            log("     uid 2000 不在 allowlist 里，只有 App/Manager 的 uid 才有授权")
+        }
     }
 
     /** 上次如果是 panic / 硬重启，p7 输出还留在 /data/local/tmp —— 捞进 App 目录留档 */

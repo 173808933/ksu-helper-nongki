@@ -8,6 +8,57 @@
 
 ## 2026-11-18
 
+### v7.7（67）— 按子 agent 审查修 6 条
+
+审查发现的 6 个真问题，逐个说：
+
+**#13 `bootId()` 的哨兵会锁死设备（最严重）**
+`bootId()` 失败时返回 `"-"`，而闸门里 `got.contains(want)` 去匹配 `.glhold` 里的 UUID
+—— **UUID 本身含连字符**，`contains("-")` 恒真。一旦 `/proc/.../boot_id` 读不到，
+之后**每次开机都会判「本次已跑过」并永久拒绝执行**（只能重启 + 手删文件恢复）。
+判断里写的 `want == "未知"` 是死代码（返回值从来不是这个）。
+改：`bootId()` 只在匹配 UUID 正则时返回，否则返回空串；闸门遇到空串**放行**并告警。
+
+**#3 ko 的磁盘缓存不校验，v7.6 的回滚在真机上不生效**
+`bundledKo()` 只要 `Android/data/<pkg>/files/ko/xxx.ko` 存在且非空就直接用。
+v7.3~v7.5 已经把 strip 过的坏 ko 释放到这个路径，升级到 v7.6 后**仍然拿旧文件去 insmod**。
+这正是「换了正确 ko 却还报 ENOEXEC」的隐形原因。
+改：比对 `assets.openFd().length` 与本地大小，不符则删除并重新释放。
+
+**#2 闸门在成功后才写，失败可以无限重跑**
+`markExploited()` 原本只在 checkRoot 成功或模块已加载后调用。但**跑失败同样扣一格**
+`init_cred.usage`（只有 4 格），连点四次就扣到 0 → 延时重启。
+改：`p7` 和 `ghostlock54` **执行前**就落标记。
+
+**#5 gl54 推送判定是假阳性**
+`push.out.contains("ghostlock54")` —— 失败的 `cp` 报错信息里本身就带这个文件名，
+判定永远通过。之后 `nohup ./ghostlock54` 找不到文件，但 `echo submitted` 照常输出，
+空转满 75s 才超时。
+改：比对远端/本地字节数 + `[ -x ]`。
+
+**#9 ksucheck 的 GRANT_ROOT 失败是预期，却提示成「root 未下来」**
+`ksucheck` 走 Shizuku 的 shell 通道（uid 2000），而 allowlist 只写 Manager 和本 App 的 uid
+—— `GRANT_ROOT` 必然 EPERM。原提示让用户去看这一行，等于把正常模块读成坏的。
+改：只采信 `GET_INFO ✓` 作为「supercall 通」的证据，并说明 GRANT_ROOT 失败属预期。
+
+**#6 模块在位分支在 5.4 上仍会走 autoKsuSetup**
+v7.1 只改了 `runGhostlock54`，漏了 `doRoot` 里「`/sys/module/kernelsu` 已存在」这条分支
+—— 它无条件调 `autoKsuSetup()`，而那里面全是 rksh 调用。改：按内核版本分叉。
+
+**已记录但本次未修**（写下来防止遗忘）
+
+| # | 问题 | 影响 | 为什么不修 |
+|---|---|---|---|
+| 1 | APK 里只有 A93 版 `ghostlock54`，Reno7 等 5.4 机型没有任何门禁 | 跑到别的 5.4 机型上就是往错地址写，大概率 panic | 需要为 gaa96 再编一份引擎，工作量大 |
+| 4 | Activity `exported="true"`，intent 的 `ko`/`cmd` 参数会拼进 shell | 同设备任意应用可触发提权链 | 调试要用 `am start`，改成 false 会挡住自己；应先做路径校验而不是直接关 |
+| 7 | `missingPackagedAssets` 是全局清单，4.19 缺个 `probe-perf` 也会阻断整条链 | 精简便打包时误伤 | 需要按内核分两组必需件 |
+| 8 | `matchesKernelRelease` 严格全等 + `kernelVer` 未 trim + 无降级 | `os.version` 带后缀时把可用 ko 全判死 | 需要先确认 Pad 上 `os.version` 的真实形态 |
+| 10 | v7.5 扩的 dmesg 关键词只在 4.19 路径生效 | 5.4 的 insmod 失败看不到内核原始报错 | 5.4 无 rksh，需写一个降级版 dmesg 读取 |
+| 11 | `loadKsu`/`deployKsud`/`runShellCmd` 缺 finally | 异常后 `running` 永久 true，按钮全灰 | 辅助路径，最坏重启 App |
+| 12 | 「已跑过漏洞」分支不装 KSU 也不验证 | 提权成功但装载失败时重试无动作 | 需要配合 #2 的语义重新设计 |
+
+---
+
 ### v7.6（versionCode 66）— 回滚 ko 的 strip/删段
 
 **改了什么**
