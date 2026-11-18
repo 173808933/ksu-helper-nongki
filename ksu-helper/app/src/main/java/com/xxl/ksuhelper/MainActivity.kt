@@ -85,7 +85,9 @@ class MainActivity : ComponentActivity() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val t0 = System.currentTimeMillis()
-    private val df = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    // SimpleDateFormat 不是线程安全的，而 log() 会被主线程/IO/Shizuku 回调并发调用。
+    // 用 java.time 的 DateTimeFormatter（不可变、线程安全）。
+    private val df = java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS")
 
     // Shizuku
     private var binderAlive by mutableStateOf(false)
@@ -216,18 +218,39 @@ class MainActivity : ComponentActivity() {
 
     // ---------------- 日志 ----------------
 
+    /** 落盘走单线程，避免主线程 fsync（StrictMode 会报 disk write on main）。 */
+    private val logWriter = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ksu-log-writer").apply { isDaemon = true }
+    }
+    @Volatile private var lastLogFlushMs = 0L
+
     private fun log(s: String) {
         val elapsed = System.currentTimeMillis() - t0
-        val line = "[${df.format(Date())} +${elapsed}ms] $s"
+        val line = "[${df.format(java.time.LocalTime.now())} +${elapsed}ms] $s"
         Log.i(TAG, line)
-        try {
-            logFile.appendText(line + "\n")
-        } catch (_: Throwable) {
+        logWriter.execute {
+            try {
+                logFile.appendText(line + "\n")
+            } catch (_: Throwable) {
+            }
         }
         synchronized(logBuf) {
             logBuf.append(line).append('\n')
             if (logBuf.length > 300_000) logBuf.delete(0, logBuf.length - 200_000)
+            // 节流：之前每来一行就 toString() 一次最多 300KB，几百行日志等于几十 MB 拷贝
+            val now = System.currentTimeMillis()
+            if (now - lastLogFlushMs >= 120) {
+                lastLogFlushMs = now
+                logText = logBuf.toString()
+            }
+        }
+    }
+
+    /** 强制把缓冲刷到 UI。流程结束时调，避免最后几行因节流没显示。 */
+    private fun flushLogText() {
+        synchronized(logBuf) {
             logText = logBuf.toString()
+            lastLogFlushMs = System.currentTimeMillis()
         }
     }
 
@@ -305,12 +328,9 @@ class MainActivity : ComponentActivity() {
             useExplicitEnv = true
             log("地址 " + p.env.entries.joinToString(" ") { "${it.key}=${it.value}" })
             log("已默认开启「注入档案地址」（否则 p7 会用它内置的 Find X3 默认地址，本机大概率错位）")
-            if (p.env.size < 8) {
-                val missing = listOf("GL_INITCRED", "GL_SELINUX", "GL_SIGENFORCE", "GL_PARANOID")
-                    .filter { it !in p.env }
-                if (missing.isNotEmpty()) {
-                    log("! 档案不完整，缺 ${missing.joinToString()} —— 这几项会沿用 p7 内置默认值，可能不正确")
-                }
+            val missing = missingKeys(p)
+            if (missing.isNotEmpty()) {
+                log("! 档案不完整，缺 ${missing.joinToString()} —— 这些项会沿用 p7 内置默认值，可能不正确")
             }
         }
     }
@@ -382,6 +402,13 @@ class MainActivity : ComponentActivity() {
      * 不能用 Process.waitFor(timeout, unit)：JDK 默认实现靠 exitValue() 轮询，
      * 只捕获 IllegalThreadStateException；ShizukuRemoteProcess 抛 IllegalArgumentException。
      */
+    /** 关闭进程的三个流。EOF 只表示读到尾，文件描述符还得显式关。 */
+    private fun closeProc(p: Process) {
+        try { p.inputStream.close() } catch (_: Throwable) {}
+        try { p.errorStream.close() } catch (_: Throwable) {}
+        try { p.outputStream.close() } catch (_: Throwable) {}
+    }
+
     private fun waitProc(proc: Process, timeoutSec: Long): Boolean {
         return try {
             if (proc is rikka.shizuku.ShizukuRemoteProcess) {
@@ -408,6 +435,7 @@ class MainActivity : ComponentActivity() {
         if (!binderAlive) return Res(-100, "Shizuku 服务未运行")
         if (!permissionGranted) return Res(-100, "Shizuku 未授权")
         val started = System.currentTimeMillis()
+        val toClose = mutableListOf<Process>()
         val r = try {
             val proc = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
             val sb = StringBuilder()
@@ -427,6 +455,7 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Throwable) {
                 }
             }
+            toClose += proc
             tOut.start(); tErr.start()
             val done = waitProc(proc, timeoutSec)
             if (!done) {
@@ -446,13 +475,18 @@ class MainActivity : ComponentActivity() {
             Res(-102, "启动进程失败: ${e.javaClass.simpleName}: ${e.message}")
         }
         Log.d(TAG, "sh[${r.code}] ${System.currentTimeMillis() - started}ms: ${cmd.take(100)}")
+        // 三个流背后是 ParcelFileDescriptor，EOF 不等于关闭。
+        // 一次提权里 sh() 会调上百次，不关会撞 fd 上限。
+        toClose.forEach { p -> closeProc(p) }
         return r
     }
 
     private fun shWithStdin(cmd: String, data: ByteArray, timeoutSec: Long = 180): Res {
         if (!binderAlive || !permissionGranted) return Res(-100, "Shizuku 未就绪")
-        return try {
+        val toClose = mutableListOf<Process>()
+        val res = try {
             val proc = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
+            toClose += proc
             val sb = StringBuilder()
             val tOut = Thread {
                 try {
@@ -493,6 +527,10 @@ class MainActivity : ComponentActivity() {
         } catch (e: Throwable) {
             Res(-102, "stdin 传输失败: ${e.javaClass.simpleName}: ${e.message}")
         }
+        // 三个流背后是 ParcelFileDescriptor，EOF 不等于关闭。
+        // 一次提权里 sh() 会调上百次，不关会撞 fd 上限。
+        toClose.forEach { p -> closeProc(p) }
+        return res
     }
 
     private fun extractAssets(): File {
@@ -504,7 +542,11 @@ class MainActivity : ComponentActivity() {
             "p7" to "p7", rk9Asset to "rk9.ko", "rkshd" to "rkshd", "rksh" to "rksh",
             // 5.4 专用引擎（源码级移植：fake lock 窗口 + rb_erase 越界写），
             // 与 p7 是两条独立路线，按内核版本二选一
-            "ghostlock54" to "ghostlock54"
+            "ghostlock54" to "ghostlock54",
+            // 只读探测件：不写内核、不提权、不烧 init_cred 预算
+            "probe.sh" to "probe.sh",
+            "probe-perf" to "probe-perf",
+            "ksucheck" to "ksucheck"
         )
         for ((src, dst) in pairs) {
             val f = File(dir, dst)
@@ -539,7 +581,7 @@ class MainActivity : ComponentActivity() {
                 BundledKo("kernelsu-qcom157-uapi5.ko", "qcom-4.19.157 UAPI5", "4.19.157-perf+")
 
             pid in listOf(
-                "oppo_reno8_pgbm10", "oppo_a2pro_pjg110", "oppo_reno6_peqm00",
+                "oppo_a2pro_pjg110", "oppo_reno6pro_peem00",
                 "oppo_reno5pro_pdsm00", "oppo_a2m_pju110", "oppo_a97_pftm10"
             ) -> BundledKo("kernelsu-mtk419-uapi5.ko", "mtk-4.19.191 UAPI5", "4.19.191+")
 
@@ -632,16 +674,20 @@ class MainActivity : ComponentActivity() {
      *  atomic_dec(init_cred.usage)。扣到 0 时 __put_cred 会把静态 init_cred
      *  当 slab 对象释放，内核在随机位置 panic —— 表现为「提权后过一会儿重启」。
      *
-     *  所以同一次开机只许跑一次。/data/local/tmp 重启会清空，标记自然失效。
+     *  所以同一次开机只许跑一次。注意 /data/local/tmp 挂在 /data 上，
+     *  重启并不会清空它 —— 所以标记里必须写 boot_id，靠它判断是否同一轮开机。
      */
     private fun alreadyExploitedThisBoot(): Boolean {
-        val r = sh("[ -f /data/local/tmp/.glhold ] && echo HOLD || echo NONE", 10).out
-        return r.contains("HOLD")
+        val want = bootId().trim()
+        if (want.isBlank() || want == "未知") return false
+        val got = sh("cat /data/local/tmp/.glhold 2>/dev/null || echo NONE", 10).out.trim()
+        return got.contains(want)
     }
 
     private fun markExploited() {
-        sh("date +%s > /data/local/tmp/.glhold 2>/dev/null; echo ok", 10)
-        log("  已写入 .glhold（本次开机不再跑漏洞）")
+        val id = bootId().trim()
+        sh("printf '%s\\n' '$id' > /data/local/tmp/.glhold 2>/dev/null; echo ok", 10)
+        log("  已写入 .glhold（boot_id=$id，本次开机不再跑漏洞）")
     }
 
     private fun checkRoot(quiet: Boolean = false): Boolean {
@@ -731,6 +777,71 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 推送 + 探测：一个动作做完，全程不跑漏洞、不烧 init_cred 预算。
+     *
+     *  1. 按内核版本把引擎（5.4 是 ghostlock54，4.19 是 p7）推到 /data/local/tmp
+     *  2. 自检 uid / selinux / CapEff / chrt（chrt 被挡则 gl54 跑不起来）
+     *  3. probe.sh 采集 sysctl / kallsyms / config.gz
+     *  4. probe-perf 用 perf 采样验证 x20 与 x29-40
+     *
+     *  注意：ELf 不能从 /storage/emulated 直接执行（noexec），必须推 /data/local/tmp。
+     *  整个函数体在 IO 线程，sh() 是同步阻塞的，在主线程跑 probe.sh 会 ANR。 */
+    private fun runProbe() {
+        if (running) return
+        scope.launch {
+            running = true
+            try {
+                log("========== 推送 + 探测（不跑漏洞，不烧预算）==========")
+                withContext(Dispatchers.IO) {
+                    val dir = extractAssets()
+                    log("  组件目录: ${dir.absolutePath}")
+                    val engine = if (kernelVer.startsWith("5.4")) "ghostlock54" else "p7"
+
+                    busyLabel = "推送组件"
+                    log("== 1/4 推送引擎（$engine）==")
+                    if (pushFile(File(dir, engine), "/data/local/tmp/$engine")) {
+                        sh("chmod 755 /data/local/tmp/$engine 2>/dev/null", 15)
+                        log("  $engine -> /data/local/tmp/$engine  OK")
+                        log("  可手动跑: adb shell /data/local/tmp/$engine")
+                    } else {
+                        log("  !! 推送失败（探测继续，只是没法手动跑）")
+                    }
+
+                    busyLabel = "权限自检"
+                    log("== 2/4 权限自检 ==")
+                    log(
+                        sh(
+                            "echo -n 'uid     : '; id; " +
+                                    "echo -n 'selinux : '; getenforce; " +
+                                    "echo -n 'cap     : '; grep CapEff /proc/self/status; " +
+                                    "echo -n 'chrt    : '; chrt -f 1 /system/bin/true 2>&1; echo rc=\$?", 30
+                        ).out.trimEnd()
+                    )
+
+                    busyLabel = "探测"
+                    sh("chmod 755 $dir/probe.sh 2>/dev/null", 15)
+                    log("== 3/4 probe.sh：sysctl / kallsyms / selinux / config.gz ==")
+                    log(sh("sh $dir/probe.sh 2>&1", 120).out.trimEnd())
+
+                    log("== 4/4 probe-perf：验证 x20 与 x29-40 ==")
+                    if (pushFile(File(dir, "probe-perf"), "/data/local/tmp/probe-perf")) {
+                        sh("chmod 755 /data/local/tmp/probe-perf 2>/dev/null", 15)
+                        log(sh("/data/local/tmp/probe-perf 2>&1", 120).out.trimEnd())
+                    } else {
+                        log("  !! probe-perf 推送失败，跳过（无法验证 x20）")
+                    }
+                }
+                log("========== 完成 ==========")
+            } catch (e: Throwable) {
+                log("!! 失败: ${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                flushLogText()
+                busyLabel = ""
+                running = false
+            }
+        }
+    }
+
     private fun exportLog() {
         val nowMs = System.currentTimeMillis()
         if (nowMs - lastExportAt < 2500) {
@@ -740,7 +851,8 @@ class MainActivity : ComponentActivity() {
         lastExportAt = nowMs
         scope.launch {
             withContext(Dispatchers.IO) {
-                if (permissionGranted) collectDiagnostics("导出前")
+                // 运行中不要采诊断：一次会拉起十几个 sh，给 p7 的 perf 采样加压
+                if (permissionGranted && !running) collectDiagnostics("导出前")
                 try {
                     val dir = File(getExternalFilesDir(null), "logs")
                     dir.mkdirs()
@@ -820,16 +932,35 @@ class MainActivity : ComponentActivity() {
         running = true
         scope.launch {
             val started = System.currentTimeMillis()
-            val ok = withContext(Dispatchers.IO) { doRoot() }
-            busyLabel = ""
-            running = false
-            log("总耗时 ${System.currentTimeMillis() - started}ms")
-            log(if (ok) "== 完成：root 已就绪 ==" else "== 失败 ==")
-            withContext(Dispatchers.IO) { collectDiagnostics(if (ok) "成功" else "失败") }
+            try {
+                val ok = withContext(Dispatchers.IO) { doRoot() }
+                log("总耗时 ${System.currentTimeMillis() - started}ms")
+                log(if (ok) "== 完成：root 已就绪 ==" else "== 失败 ==")
+                withContext(Dispatchers.IO) { collectDiagnostics(if (ok) "成功" else "失败") }
+            } catch (e: Throwable) {
+                log("!! 流程异常: ${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                // 没有 finally 的话，中途抛异常会让 running 永久 true，所有按钮变灰且无法恢复
+                flushLogText()
+                busyLabel = ""
+                running = false
+            }
         }
     }
 
     private suspend fun doRoot(): Boolean = withContext(Dispatchers.IO) {
+        // 闸门：init_cred.usage 只有 4，同一次开机重复跑会把内核扣崩。
+        if (alreadyExploitedThisBoot()) {
+            log("  本次开机已跑过漏洞（boot_id 匹配 .glhold），拒绝重复执行")
+            log("  如需重跑，重启设备（重启会重置 init_cred 计数）")
+            return@withContext checkRoot()
+        }
+        // 模块已在位说明内核侧没必要再动，直接走装载/校验
+        if (sh("[ -d /sys/module/kernelsu ] && echo Y || echo N", 10).out.contains("Y")) {
+            log("  kernelsu 模块已在位（/sys/module/kernelsu 存在），跳过漏洞直接校验")
+            if (autoKsu) autoKsuSetup()
+            return@withContext true
+        }
         try {
             section("一键提权")
             ranRootThisSession = true
@@ -1001,7 +1132,9 @@ class MainActivity : ComponentActivity() {
         val dir = extractAssets()
         val bin = File(dir, "ghostlock54")
         log("  ${bin.absolutePath} (${bin.length()} 字节)")
-        if (!bin.exists() || bin.length() < 500_000) {
+        // 阈值必须低于真实体积。A93 版编出来是 368,576 B（STRIP=1，含精简 ko），
+        // 之前写成 500_000 会让 5.4 路径在这里直接 return false —— 漏洞根本不执行。
+        if (!bin.exists() || bin.length() < 300_000) {
             log("  !! ghostlock54 提取失败"); return@withContext false
         }
 
@@ -1041,11 +1174,19 @@ class MainActivity : ComponentActivity() {
                 modOk = true
                 log("  [${elapsed}s] kernelsu 模块已加载")
             }
-            // 顺带看一眼 root 是否真的下来了（ghostlock 的 -s 模式会给 uid=0）
             if (modOk && round > 3) {
-                val idOut = sh("id 2>&1", 8).out.trim()
-                log("  [${elapsed}s] ✅ 提权完成（${idOut.take(60)}）")
+                // 不能用 `id` 当证据：那是在 shell(uid 2000) 里跑的，恒输出 uid=2000。
+                // 真正的判据是模块加载 + 后续 ksucheck 的 GRANT_ROOT。
+                log("  [${elapsed}s] kernelsu 模块已加载（提权结果由 ksucheck 验证）")
                 markExploited()
+                // 5.4 这条以前直接 return，导致 ksud 从不部署、allowlist 从不写，
+                // 「提权后自动装 KSU」开关在 5.4 上等于摆设。这里补上。
+                if (autoKsu) {
+                    log("  --- 进入 KSU 装载流程（写 allowlist / 部署 ksud / rmmod 重载）---")
+                    autoKsuSetup()
+                } else {
+                    log("  ! 「提权后自动装 KSU」是关的，跳过装载")
+                }
                 return@withContext true
             }
             if (round % 4 == 0) {
@@ -1104,7 +1245,7 @@ class MainActivity : ComponentActivity() {
                 .out.trim().toIntOrNull()
             val entries = ArrayList<Pair<Int, String>>()
             if (mgrUid != null && mgrUid > 0) entries.add(mgrUid to "me.weishu.kernelsu")
-            entries.add(uid to "com.xxl.ksuhelper")
+            entries.add(uid to packageName)   // 不能用硬编码：.p2 变体的 applicationId 不同
             for ((u, pkg) in entries) {
                 val p = ByteArray(784)
                 p[0] = 4                                   // profile.version
@@ -1125,20 +1266,15 @@ class MainActivity : ComponentActivity() {
             log("  allowlist 条目: " + entries.joinToString { "${it.second}=${it.first}" })
             val data = buf.toByteArray()
 
-            // 写到 external files 而不是 cacheDir：
-            // cacheDir 是 /data/user/0/<pkg>/cache（0700，属主是 App uid），
-            // sh()（shell 2000）连读都读不到，cp 会直接 Permission denied。
-            val dst = getExternalFilesDir(null) ?: cacheDir
-            val f = File(dst, "allowlist.bin")
-            f.writeBytes(data)
-            // 先由 shell 送到 /data/local/tmp（shell 可写），
-            // 再让 rksh（root）搬进 /data/adb —— 那里是 0700 root，
-            // 直接用 sh() 会 mkdir/stat 全部失败。
-            val staged = sh("cp -f '${f.absolutePath}' /data/local/tmp/allowlist.bin && chmod 644 /data/local/tmp/allowlist.bin && echo ok", 30)
-            if (!staged.out.contains("ok")) {
-                log("  ! allowlist 中转失败：${staged.out.trim().take(80)}")
+            // 统一走 pushFile：它内部是 stdin + base64，不依赖 shell 能否读 App 私有目录。
+            // 之前用 getExternalFilesDir(null) ?: cacheDir 做兜底，但 cacheDir 是 0700，
+            // 兜底分支必然失败 —— 等于没有兜底。
+            val tmp = File(cacheDir, "allowlist.bin").apply { writeBytes(data) }
+            if (!pushFile(tmp, "/data/local/tmp/allowlist.bin")) {
+                log("  ! allowlist 推送失败")
                 return
             }
+            sh("chmod 644 /data/local/tmp/allowlist.bin 2>/dev/null", 15)
             val r = sh("/data/local/tmp/rksh -c 'mkdir -p /data/adb/ksu && " +
                     "cp -f /data/local/tmp/allowlist.bin /data/adb/ksu/.allowlist && " +
                     "chmod 600 /data/adb/ksu/.allowlist && stat -c %s /data/adb/ksu/.allowlist' 2>&1", 40)
@@ -1159,9 +1295,25 @@ class MainActivity : ComponentActivity() {
         log("  内核 $kernelVer  档案 ${p?.name ?: "(无)"}  SELinux ${sh("getenforce 2>/dev/null", 10).out.trim()}")
 
         // 1) ko：/sdcard/Download 下用户手放的优先（便于换 UAPI/换组），否则用内置
-        var ko = sh("ls -1 /sdcard/Download/*.ko 2>/dev/null | head -1", 20).out.trim()
+        // Download 里可能同时放着多个机型的 ko，盲取 `head -1` 会 insmod 错的那个。
+        // 逐个比对 vermagic，只接受与本机内核匹配的；都不匹配就退回内置。
+        var ko = ""
+        val cands = sh("ls -1 /sdcard/Download/*.ko 2>/dev/null", 20).out
+            .lines().map { it.trim() }.filter { it.isNotEmpty() }
+        if (cands.isNotEmpty()) {
+            var picked: String? = null
+            for (c in cands) {
+                val head = koVermagic(File(c))?.split(" ")?.firstOrNull()
+                val okVm = head == null || head == kernelVer ||
+                        kernelVer.startsWith(head) || head.startsWith(kernelVer)
+                log("  Download 候选 $c  vermagic=${head ?: "(读不到)"} -> ${if (okVm) "匹配" else "跳过"}")
+                if (okVm && picked == null) picked = c
+            }
+            if (picked != null) ko = picked
+            else log("  ! Download 里的 ko 都不匹配本机 $kernelVer，改用内置")
+        }
         if (ko.isNotEmpty()) {
-            log("  ko 来源: $ko（Download 目录，优先于内置）")
+            log("  ko 来源: $ko（Download，vermagic 已匹配）")
         } else {
             val b = pickBundledKo()
             if (b == null) {
@@ -1267,6 +1419,17 @@ class MainActivity : ComponentActivity() {
         val ver = sh("/data/local/tmp/rksh -c '/data/adb/ksud --version' 2>&1 | head -3", 60).out.trim()
         log("  ksud --version: ${ver.ifBlank { "(无输出)" }}")
         log("  → 现在打开 KSU 管理器应能看到已安装；若仍显示未安装，重启后再提权一次")
+        // ★ 真验证：直接问内核，而不是拿「模块 Live」这种间接证据当结论。
+        //   reboot hook 装 fd → GET_INFO 拿版本 → GRANT_ROOT 确认 allowlist 生效。
+        // ELF 从 /storage/emulated 执行会 Permission denied（noexec），先推到 /data/local/tmp
+        val chk = File(File(getExternalFilesDir(null), "bin"), "ksucheck")
+        if (chk.exists() && pushFile(chk, "/data/local/tmp/ksucheck")) {
+            sh("chmod 755 /data/local/tmp/ksucheck 2>/dev/null", 15)
+            log("  --- ksucheck：向内核确认 supercall 与 allowlist ---")
+            log(sh("/data/local/tmp/rksh -c '/data/local/tmp/ksucheck 2>&1'", 60).out.trimEnd())
+        } else {
+            log("  ! ksucheck 未就位，跳过内核侧验证")
+        }
     }
 
     /** 上次如果是 panic / 硬重启，p7 输出还留在 /data/local/tmp —— 捞进 App 目录留档 */
@@ -1355,7 +1518,17 @@ class MainActivity : ComponentActivity() {
         // 但 punch 已经把伪造 waiter 摆进内核栈了，于是"提权失败 + 之后按电源键就重启"。
         sb.append(" GL_AUTO=1")
         if (hasExplicit) {
-            activeProfile?.env?.forEach { (k, v) -> sb.append(' ').append(k).append('=').append(v) }
+            // profiles.json 可以被用户从 Android/data 里替换，值直接拼进命令行就是 shell 注入。
+            // 只放行 GL_ 开头的键和「地址/数字」形态的值，不合规的丢掉并记日志。
+            val keyRe = Regex("^GL_[A-Z0-9_]+$")
+            val valRe = Regex("^[0-9a-zA-Z_]+$")
+            activeProfile?.env?.forEach { (k, v) ->
+                if (keyRe.matches(k) && valRe.matches(v)) {
+                    sb.append(' ').append(k).append('=').append(v)
+                } else {
+                    log("  ! 档案里过滤掉可疑条目：$k=$v（只允许 GL_* 与字母数字值）")
+                }
+            }
         }
         sb.append(" GL_KO=").append(ko)
         return sb.toString()
@@ -1379,7 +1552,11 @@ class MainActivity : ComponentActivity() {
             "probe" -> probe()
             "selfcheck" -> pushOnly()
             "status" -> statusAll()
-            "root" -> startRoot(intent?.getBooleanExtra("force", false) == true)
+            // --es 传的是 String，--ez 才是 Boolean，两个都认
+            "root" -> startRoot(
+                (intent?.getStringExtra("force")?.toBoolean() == true) ||
+                        (intent?.getBooleanExtra("force", false) == true)
+            )
             "loadko" -> loadKsu(koPath)
             "ksud" -> deployKsud(ksudPath)
             "cmd" -> runRootCmd(rootCmd)
@@ -1435,6 +1612,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             log(if (ok) "== 自检通过 ==" else "== 自检失败 ==")
+            flushLogText()
             busyLabel = ""
             running = false
         }
@@ -1446,7 +1624,9 @@ class MainActivity : ComponentActivity() {
             withContext(Dispatchers.IO) {
                 log("$ rksh -c $cmd")
                 val t = System.currentTimeMillis()
-                val r = sh("/data/local/tmp/rksh -c '$cmd' 2>&1", 120)
+                // 不能把命令塞进单引号：cmd 里含 ' 会被截断成多个参数。
+                // 走 stdin 让 rksh 从管道读，shell 不参与解析。
+                val r = shWithStdin("/data/local/tmp/rksh -c \"\$(cat)\" 2>&1", cmd.toByteArray())
                 log(r.out.trimEnd())
                 log("[exit ${r.code} ${System.currentTimeMillis() - t}ms]")
             }
@@ -1688,10 +1868,10 @@ class MainActivity : ComponentActivity() {
 
                 Spacer(Modifier.height(6.dp))
                 OutlinedButton(
-                    onClick = { pushOnly() },
+                    onClick = { runProbe() },
                     enabled = !running && permissionGranted,
                     modifier = Modifier.fillMaxWidth()
-                ) { Text("只推送组件（自检，不跑漏洞）") }
+                ) { Text("推送 + 探测（自检，不跑漏洞）") }
 
                 Spacer(Modifier.height(14.dp))
                 Card(Modifier.fillMaxWidth()) {
@@ -1745,7 +1925,7 @@ class MainActivity : ComponentActivity() {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("日志", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                     TextButton(onClick = { synchronized(logBuf) { logBuf.clear() }; logText = "" }) { Text("清空") }
-                    TextButton(onClick = { exportLog() }) { Text("导出") }
+                    TextButton(onClick = { exportLog() }, enabled = !running) { Text("导出") }
                 }
                 Card(Modifier.fillMaxWidth()) {
                     SelectionContainer {

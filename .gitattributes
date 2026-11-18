@@ -1,0 +1,26 @@
+# 统一换行：脚本和源码必须是 LF，否则推到 Android 上跑不起来
+# （CRLF 的 .sh 会报 `set: -: invalid option` 这类诡异错误）
+* text=auto
+
+*.sh      text eol=lf
+*.c       text eol=lf
+*.h       text eol=lf
+*.kt      text eol=lf
+*.kts     text eol=lf
+*.gradle  text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.pro     text eol=lf
+
+# 二进制：不允许任何换行转换
+*.png     binary
+*.jpg     binary
+*.ko      binary
+*.apk     binary
+*.so      binary
+p7        binary
+rksh      binary
+rkshd     binary
+ghostlock54 binary
+probe-perf binary
+ksucheck  binary
