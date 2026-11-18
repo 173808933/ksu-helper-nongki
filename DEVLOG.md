@@ -8,6 +8,64 @@
 
 ## 2026-11-18
 
+### 拿到对方的 4.19 适配源码，按 Pad 编出 ko（metadata 全对，但仍不通）
+
+**关键发现：加载参数是 `kln=0x… level=3`**
+
+从对方 `ksu` 载荷里抽出 `lt/gl_v112`，它的字符串表里写着：
+
+```
+init param: %s
+kln=0x%lx level=3
+```
+
+`level` 是他们的核心参数：源码里 `ksu54_level` 控制三档
+- `>=1` → `ksu_syscall_hook_init()` 装 dispatcher（否则打印 `skip dispatcher install` 直接返回）
+- `>=2` → `ksu54_install_table_hooks()` + setuid/sucompat
+- `>=3` → 额外 hook `__NR_read`/`__NR_fstat` + 注册 `input_event_kprobe`
+
+我们之前一直只传 `kln`，等于 level=0，**根本没装 hook**。
+
+**源码与构建**
+
+仓库 `awjdxcy/ghostlock-pju110-4.19-ksu` 的 `src/ksu/` 就是 4.19 适配副本（GPL-3.0），
+`BUILD.md` 明确三条：`-ffixed-x18`、空 `Module.symvers`、未定义符号表要和上一版一致。
+用 clang + ld.lld 对 Pad 树（`/home/dev/sm8250-kern`）编译，只需补一个 `strscpy_pad`
+（4.19.157 没有，4.19.191 的 vendor 树回移了）。
+
+产物 `modules/pad-4.19.157-ksu.ko`：
+
+```
+vermagic = 4.19.157-perf+ SMP preempt mod_unload modversions aarch64   ✓ 与设备逐字一致
+__this_module = 0x340 = 832                                          ✓ 与探针实测一致
+参数 = allow_shell block_modules bundled enforce_after force_feature kln level norc
+```
+
+**但 supercall 仍然不通**
+
+部署对方同款 `libksud.so`（md5 `b7b87ee9…`，uapi 5）到 `/data/adb/ksud`，
+`insmod d.ko kln=0xffffff924679e718 level=3` → `RC=0`、`Live`，
+`ksud feature check adb_root` 仍报 `could not retrieve kernelsu driver fd`。
+
+**最反常的一点：加载后内核一条日志都没有**
+
+`dmesg -C` 清空 → insmod → 等 3 秒 → 只有 OPPO 充电日志，**零条模块相关记录**。
+连 `kernelsu: loading out-of-tree module taints kernel` 这种内核自己打的都没有。
+把 `pr_info` 改成 `pr_err` 重编也一样。所以**不能靠 dmesg 定位**。
+
+**下一步最可疑的方向：rk9 与 kernelsu 抢 syscall 表**
+
+Pad 上的流程是 p7 → rk9.ko（`rk9(OE)` 在模块列表里），rk9 自己就 patch 系统调用表；
+而对方的 A2x 环境用的是 `gl_v112`，**没有 rk9**。
+两个模块同时改 syscall 表，后装的那个可能被覆盖或直接失败——
+这也解释了「模块 Live、无日志、supercall 不通」。
+
+验证办法（有代价）：`rmmod rk9` 后再装 kernelsu。但 rkshd 依赖 rk9，卸载后
+root 通道可能直接失效，而本次开机的 `init_cred` 预算已用掉，**必须重启才能重来**。
+所以这次没有擅自做，等确认。
+
+---
+
 ### OPPO Pad 实机验证（20:00~20:40）— 模块是空壳，管理器版本也不对
 
 **现场结果**
