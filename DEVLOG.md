@@ -8,6 +8,41 @@
 
 ## 2026-11-18
 
+### 决定性对照实验：这颗内核上模块 init 根本不执行
+
+用三个模块做对照，全部"加载成功但什么都没发生"：
+
+| 模块 | 内容 | 结果 |
+|---|---|---|
+| `mini.ko`（clang） | `module_init` 里 `proc_create_single("mini_probe")` | `rc=0`、`Live`，`/proc/mini_probe` **不存在** |
+| `mini2.ko`（clang） | init 第一行 `printk(KERN_EMERG "MINI: init running")` | `dmesg -C` 后加载，dmesg **完全空** |
+| `mini3.ko`（gcc） | 同 mini | 同样 `rc=0`、节点不存在、dmesg 空 |
+
+`KERN_EMERG` 是最高优先级，连它都不出现 → **不是 printk 被过滤，是 init 没被调用**。
+换编译器（clang14 / gcc）结果一致 → 不是工具链问题。
+
+**这解释了之前所有现象**：kernelsu 加载后 `Live`、无日志、`/proc` 探针不出现、
+hook 全无、`ksud` 拿不到 fd —— 因为模块的 init 从未执行，整段初始化都没跑。
+
+排除了的错误方向（都实测）：
+- `sizeof(struct module)`：Pad 实测 832，与 ko 一致
+- vermagic / kln 地址 / 参数名：全部核对正确
+- `rk9` 抢 syscall 表：`rmmod rk9` 后依然不通
+- `.init.text` 段首不是 `kernelsu_init_early`：已修（辅助函数移出 `__init`），无效
+- clang 的 `.init_array`：查了内核源码，那条是给构造函数用的，与 init 无关
+
+**当前判断：本次开机的内核状态被 p7/rk9 污染了**
+
+p7 提权后会留下 uid=0 常驻进程和 rk9 的 hook，`rmmod rk9` 之后 syscall 表里
+可能还指着已释放的代码。在这种状态下，`init_module` 走完但模块 init 被跳过。
+对方 A2x 是全新开机 + `gl` 直接注入，没有中间这一层。
+
+**下一步**：重启 Pad → 重新跑 p7（新开机 `init_cred` 预算会重置）→
+立刻用 `insmod <ko> kln=0x… level=3` 加载，看 `/proc/ksu_probe` 是否出现。
+出现就说明 init 正常，接着验证 `ksud feature check`。
+
+---
+
 ### 拿到对方的 4.19 适配源码，按 Pad 编出 ko（metadata 全对，但仍不通）
 
 **关键发现：加载参数是 `kln=0x… level=3`**
@@ -135,6 +170,46 @@ KernelSU: patch syscall %d failed
 **顺带清掉的残留**
 `/data/local/tmp/kernelsu.ko` 是 13:19 那个 238,760 字节的 strip 版，已确认不是这次加载的文件；
 这次实际用的是 `/sdcard/Download/kernelsu.ko`（4,195,232 字节原始版）。
+
+---
+
+### v8.1（71）— 重编 A93 引擎：修 glibc/无签名两个硬伤
+
+**改了什么**
+- `assets/ghostlock54` 换成新编的 A93 引擎（1,084,088 B，`Type: EXEC`、无 INTERP）
+  - 源码 `_gl54/ghostlock54.c` 的副本改成 `_pehm00/engine/ghostlock54-a93.c`
+  - 新增 `#define OFF_SIG_ENFORCE UINT64_C(0x27bd7a0)` 与一次 `write_value(..., 0)`
+  - 用 `aarch64-linux-gnu-gcc -static -O2 -pthread` 重编；内嵌 ko 从旧二进制原样抽出复用
+- 版本 8.0(70) → 8.1(71)
+
+**为什么改（两条都是实测出来的）**
+
+1. **旧 A93 引擎根本跑不起来**：改之前 `assets/ghostlock54` 的 ELF 头是
+   `INTERP /lib/ld-linux-aarch64.so.1` + `NEEDED libc.so.6` —— glibc 动态链接。
+   Android 只有 bionic/`linker64`，`execve` 会因找不到 interpreter 直接失败。
+   也就是说这条 A93 路线此前从未真正执行过，之前的"集成"只做到文件在位。
+
+2. **`PEHM00_11.C.42` 的内核 `CONFIG_MODULE_SIG_FORCE=y`**，内嵌 ko 未签名（无
+   `~Module signature appended~`），`insmod` 必 `-ENOKEY`。`bool_enable_only` 决定它
+   一旦为 1 就写不回 0（sysfs -EROFS、cmdline 同样被拒），只能用任意写清零。
+   Reno7（PFJM10）那份是 `CONFIG_MODULE_SIG` 未开 —— **"5.4 引擎通用"这个想法本身是错的**，
+   同一份引擎在两台机器上半段能跑、后半段装不上模块。
+
+**怎么验证的**
+- 从 `PEHM00_11.C.42` 全量包 Range 取 boot（160 MB），IKCFG 解出真实配置 6,666 行，
+  重建 174,356 个 kallsyms 符号：
+  `init_task`/`init_cred`/`selinux_state`/`sel_read_enforce` 与 A93 常量 0 偏差；
+  `futex_unlock_pi+0x618` 处反汇编为 `sub x1, x29, #0x28` + `bl __rt_mutex_futex_unlock`，
+  与源码注释逐字对上 ⇒ 这份固件的内核就是当初标定的那一份。
+- 新常量也用同一份符号表核过：`0x27bd7a0 = sig_enforce(0xffffffc01283d7a0) - _text`；
+  邻居是 `module_notify_list`（+8），中间 7 字节是 8 字节对齐填充，写 8 字节不会波及。
+- 新二进制：内嵌 ko 仍 333,704 B、vermagic `g9ef4a332d496`；字符串含 `sig_enforce -> 0`。
+
+**没验证的**
+- 没有 PEHM00 真机，一次都没跑过；静态链接版在 ColorOS 上的实际行为、签名清零是否真生效，
+  只能上机看 insmod 结果。
+- 代价：`write_value` 每轮消耗的 fake-lock 窗口从 4 个变成 5 个（池子 10 个），
+  一次开机最多跑 2 轮，第 3 轮会打印 `Out of fake lock windows`。
 
 ---
 
