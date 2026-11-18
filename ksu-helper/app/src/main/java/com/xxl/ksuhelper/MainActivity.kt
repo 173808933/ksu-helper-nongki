@@ -70,6 +70,19 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val REQ_SHIZUKU = 1001
         private const val TAG = "KsuHelper"
+
+        /** 纯文本校验，可在本地单元测试，不执行 shell 或加载模块。
+         *  必须**完整** release 相等：前缀相同不代表同一构建（5.4.254 vs 5.4.254-qgki-g9ef4…），
+         *  读不到标识也不能当匹配 —— 拿错 ko 去 insmod 的代价是内核崩。 */
+        internal fun matchesKernelRelease(vermagic: String?, kernelRelease: String): Boolean {
+            val release = vermagic?.trim()?.split(Regex("\\s+"))?.firstOrNull()
+            return !release.isNullOrBlank() && kernelRelease.isNotBlank() && release == kernelRelease
+        }
+
+        /** uid=0 必须整词匹配：`euid=0`、`uid=00`、`uid=0unexpected` 都不算，
+         *  且命令本身必须成功（超时/失败时输出里可能有残留的 uid=0）。 */
+        internal fun isRootIdentity(exitCode: Int, output: String): Boolean =
+            exitCode == 0 && Regex("(?:^|\\s)uid=0(?:\\(|\\s|$)").containsMatchIn(output)
     }
 
     /** 设备档案：机型匹配后提供该机型的 GL_* 地址 */
@@ -533,7 +546,49 @@ class MainActivity : ComponentActivity() {
         return res
     }
 
+    /** 本地 APK 完整性检查，不访问设备 shell，也不执行任何引擎。 */
+    private fun missingPackagedAssets(): List<String> {
+        val bundled = assets.list("")?.toSet().orEmpty()
+        val rk9Asset = if (kernelVer.startsWith("5.4")) "rk9-54.ko" else "rk9.ko"
+        val required = listOf(
+            "p7", rk9Asset, "rkshd", "rksh", "ghostlock54",
+            "probe.sh", "probe-perf", "ksucheck", "profiles.json"
+        )
+        return required.filter { it !in bundled }
+    }
+
+    private fun auditPackagedAssets() {
+        if (running) return
+        running = true
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    section("APK 完整性检查（仅本地读取）")
+                    val missing = missingPackagedAssets()
+                    val bundled = assets.list("")?.sorted().orEmpty()
+                    log("  包内资源：${bundled.joinToString()}")
+                    log("  内核：$kernelVer；该结果只检查文件存在，不证明内核兼容")
+                    if (missing.isEmpty()) {
+                        log("  文件存在性检查通过；尚未验证授权、模块或 root")
+                    } else {
+                        log("  检查未通过：缺少 ${missing.joinToString()}")
+                        log("  组件释放将被阻断，未执行推送、提权或内核操作")
+                    }
+                }
+            } catch (e: Throwable) {
+                log("!! APK 检查失败: ${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                flushLogText()
+                busyLabel = ""
+                running = false
+            }
+        }
+    }
+
     private fun extractAssets(): File {
+        // fail-closed：缺件就不放行，别等推到设备上才报一堆莫名其妙的错
+        val missing = missingPackagedAssets()
+        check(missing.isEmpty()) { "APK 缺少必需资源：${missing.joinToString()}；已在释放组件前停止" }
         val dir = File(getExternalFilesDir(null), "bin")
         if (!dir.exists() && !dir.mkdirs()) error("无法创建目录 ${dir.absolutePath}")
         // rk9 是内核模块，4.19 和 5.4 的 KAPI 不同，按内核版本选
@@ -623,6 +678,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 读不到标识不得当作匹配；只比较完整 release，非 GKI 仍需另核对 CRC/CFI。 */
+    private fun matchesKernelRelease(vermagic: String?): Boolean =
+        Companion.matchesKernelRelease(vermagic, kernelVer)
+
     /** 从 ko 里抠出 vermagic 字符串，用于运行前比对内核（不匹配就别 insmod 了） */
     private fun koVermagic(f: File): String? = try {
         val b = f.readBytes()
@@ -692,7 +751,7 @@ class MainActivity : ComponentActivity() {
 
     private fun checkRoot(quiet: Boolean = false): Boolean {
         val r = sh("[ -S /data/local/tmp/rksh.sock ] && /data/local/tmp/rksh -c 'id' 2>&1", 20)
-        val ok = r.out.contains("uid=0")
+        val ok = isRootIdentity(r.code, r.out)
         rootReady = ok
         if (ok && !quiet) log("  root: ${r.out.trim()}")
         return ok
@@ -935,8 +994,22 @@ class MainActivity : ComponentActivity() {
             try {
                 val ok = withContext(Dispatchers.IO) { doRoot() }
                 log("总耗时 ${System.currentTimeMillis() - started}ms")
-                log(if (ok) "== 完成：root 已就绪 ==" else "== 失败 ==")
-                withContext(Dispatchers.IO) { collectDiagnostics(if (ok) "成功" else "失败") }
+                // 主流程 ok 只代表「引擎没报错」，不代表 root 真的可用。
+                // 5.4 没有 rksh（rk9/rkshd 未适配 A93），checkRoot 必然 false ——
+                // 这种情况下如实报「未核验」，别把模块加载当成提权成功。
+                val rootObserved = ok && withContext(Dispatchers.IO) { checkRoot(quiet = true) }
+                log(when {
+                    rootObserved -> "== root 通道已核验；KSU 授权和管理器仍需分别验收 =="
+                    ok -> "== 主流程结束，但 root 未核验；模块存在不等于授权成功 =="
+                    else -> "== 流程失败或未完成 =="
+                })
+                if (ok && !rootObserved && kernelVer.startsWith("5.4")) {
+                    log("   5.4 路径没有 root shell（rksh 依赖 rkshd+rk9，尚未适配），")
+                    log("   root 是否真的下来了请看上面 ksucheck 的 GRANT_ROOT 一行")
+                }
+                withContext(Dispatchers.IO) {
+                    collectDiagnostics(if (rootObserved) "root 通道已核验" else "root 未核验")
+                }
             } catch (e: Throwable) {
                 log("!! 流程异常: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
@@ -1309,8 +1382,7 @@ class MainActivity : ComponentActivity() {
             var picked: String? = null
             for (c in cands) {
                 val head = koVermagic(File(c))?.split(" ")?.firstOrNull()
-                val okVm = head == null || head == kernelVer ||
-                        kernelVer.startsWith(head) || head.startsWith(kernelVer)
+                val okVm = matchesKernelRelease(head)
                 log("  Download 候选 $c  vermagic=${head ?: "(读不到)"} -> ${if (okVm) "匹配" else "跳过"}")
                 if (okVm && picked == null) picked = c
             }
@@ -1333,9 +1405,7 @@ class MainActivity : ComponentActivity() {
             log("  内置 ${b.asset}  ${f.length() / 1024} KB  组: ${b.label}")
             log("  ko vermagic: ${vm ?: "(读不到)"}")
             log("  本机 uname  : $kernelVer")
-            val vmOk = vm == null || vm.split(" ").first().let {
-                it == kernelVer || kernelVer.startsWith(it) || it.startsWith(kernelVer)
-            }
+            val vmOk = matchesKernelRelease(vm)
             if (!vmOk) {
                 log("  !! vermagic 不匹配（ko=${vm?.split(" ")?.first()}，本机=$kernelVer）")
                 log("     多半是内核小版本不同（如 .155 vs .157）。先别 insmod，找同版本内核的 boot 重编 ko。")
@@ -1597,17 +1667,23 @@ class MainActivity : ComponentActivity() {
         if (running) return
         running = true
         scope.launch {
-            withContext(Dispatchers.IO) {
-                section("probe")
-                for (c in listOf("id", "uname -r", "getenforce", "grep CapEff /proc/self/status")) {
-                    val t = System.currentTimeMillis()
-                    val r = sh(c, 20)
-                    log("  [$c] exit=${r.code} ${System.currentTimeMillis() - t}ms")
-                    log("    ${r.out.trim()}")
+            try {
+                withContext(Dispatchers.IO) {
+                    section("probe")
+                    for (c in listOf("id", "uname -r", "getenforce", "grep CapEff /proc/self/status")) {
+                        val t = System.currentTimeMillis()
+                        val r = sh(c, 20)
+                        log("  [$c] exit=${r.code} ${System.currentTimeMillis() - t}ms")
+                        log("    ${r.out.trim()}")
+                    }
                 }
+            } catch (e: Throwable) {
+                log("!! 状态读取失败: ${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                flushLogText()
+                busyLabel = ""
+                running = false
             }
-            busyLabel = ""
-            running = false
         }
     }
 
@@ -1876,6 +1952,13 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton(onClick = { statusAll() }, enabled = !running && permissionGranted) { Text("状态") }
                     OutlinedButton(onClick = { exportLog() }, enabled = !running) { Text("导出日志") }
                 }
+
+                Spacer(Modifier.height(6.dp))
+                OutlinedButton(
+                    onClick = { auditPackagedAssets() },
+                    enabled = !running,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("APK 完整性检查（不执行引擎）") }
 
                 Spacer(Modifier.height(8.dp))
                 Button(

@@ -11,8 +11,8 @@ android {
         applicationId = "com.xxl.ksuhelper"
         minSdk = 26
         targetSdk = 37
-        versionCode = 61
-        versionName = "7.1"
+        versionCode = 62
+        versionName = "7.2"
     }
 
     buildTypes {
@@ -52,4 +52,5 @@ dependencies {
 
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
+    testImplementation("junit:junit:4.13.2")
 }
