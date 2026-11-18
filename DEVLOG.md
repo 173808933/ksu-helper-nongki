@@ -8,6 +8,37 @@
 
 ## 2026-11-18
 
+### v7.8（68）— ko 改为外置，APK 从 30 MB 回到 16 MB
+
+**改了什么**
+- 从 `assets/` 移除 `kernelsu-qcom157-uapi5.ko`、`mtk419-uapi5.ko`、`sm7325-uapi5.ko`
+  （4.19 MB + 4.45 MB + 5.66 MB = 14.5 MB，而用户只用得上其中一个）
+- `bundledKo()` 不再从 APK 解包，改为「手动指定 → Android/data/.../ko/ → 报错指引」
+- `missingPackagedAssets()` 不再要求 ko（否则缺 ko 会阻断整条提权链）
+
+**为什么**
+v7.3 把 ko 塞进 assets 是因为发现 `pickBundledKo()` 返回的文件名在 APK 里不存在
+（内置路径一直是断的）。但把三个 4~5 MB 的模块全打进去，安装包从 16 MB 涨到 30 MB，
+而**每台设备只用其中一个**。现在改为外置，由用户按机型放。
+
+**现在的 ko 查找顺序**（代码里三处，优先级从高到低）
+1. 界面「模块路径」手动指定
+2. `/sdcard/Download/*.ko` —— **推荐**，`autoKsuSetup` 会逐个比对 vermagic 后选用
+3. `Android/data/<pkg>/files/ko/<asset>` —— 由 `bundledKo()` 检查
+
+**用户需要做的**
+把对应机型的 ko 改名为 `kernelsu.ko` 放到 `/sdcard/Download/`。
+Pad（4.19.157）用 `modules/kernelsu-qcom157-uapi5.ko`。
+
+**同时去掉了版本强校验**（用户明确要求）
+ko 必须按设备树单独编，同一机型不同 build 也可能只差 localversion 后缀，
+版本串对不上不代表不能用。现在的行为：
+- `/sdcard/Download/*.ko` 全部列出，逐个打印 `vermagic / 本机`，标注一致与否，**取第一个用**
+- 内置/指定的 ko 即使 vermagic 不一致也只打警告，**继续 insmod**
+- 是否换 ko、放哪个，由用户自己判断
+
+---
+
 ### v7.7（67）— 按子 agent 审查修 6 条
 
 审查发现的 6 个真问题，逐个说：

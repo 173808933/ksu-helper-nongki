@@ -557,13 +557,12 @@ class MainActivity : ComponentActivity() {
     private fun missingPackagedAssets(): List<String> {
         val bundled = assets.list("")?.toSet().orEmpty()
         val rk9Asset = if (kernelVer.startsWith("5.4")) "rk9-54.ko" else "rk9.ko"
-        // 当前机型对应的内置 ko 也必须存在，否则 pickBundledKo() 返回的名字
-        // 在 APK 里查不到，装载会在 assets.open() 处才炸
-        val bundledKoAsset = pickBundledKo()?.asset
+        // ko 已改为外置，不再打进 APK，因此这里不检查它；
+        // 缺 ko 时由 bundledKo() 打印明确的放置指引。
         val required = listOf(
             "p7", rk9Asset, "rkshd", "rksh", "ghostlock54",
             "probe.sh", "probe-perf", "ksucheck", "profiles.json"
-        ) + listOfNotNull(bundledKoAsset)
+        )
         return required.filter { it !in bundled }
     }
 
@@ -668,31 +667,21 @@ class MainActivity : ComponentActivity() {
      */
     private fun bundledKo(b: BundledKo): File? {
         val f = File(getExternalFilesDir(null), "ko/${b.asset}")
-        // 必须校验大小：v7.3~v7.5 曾把 strip 过的坏 ko 释放到这个路径，
-        // 只判 exists 会让坏文件被永久复用 —— 换回正确 ko 的版本在真机上根本不生效。
-        val expectLen = try { assets.openFd(b.asset).length } catch (_: Throwable) { -1L }
         if (f.exists() && f.length() > 0L) {
-            if (expectLen <= 0L || f.length() == expectLen) return f
-            log("  ko 缓存大小不符（本地 ${f.length()} / APK $expectLen），重新释放")
-            f.delete()
+            log("  ko 来源: ${f.absolutePath}（${f.length()} B）")
+            return f
         }
-        return try {
-            f.parentFile?.mkdirs()
-            assets.open(b.asset).use { i ->
-                f.outputStream().use { o -> i.copyTo(o) }
-            }
-            f
-        } catch (e: Throwable) {
-            log("  ! 未找到模块 ${b.asset}")
-            log("    新版把内置 ko 移出了 APK（省 20MB），请放一份到：")
-            log("      ${f.absolutePath}")
-            if (File(koPath).exists()) {
-                log("    检测到手动指定的 $koPath，本轮改用它")
-                return File(koPath)
-            }
-            log("    也可以在上方「模块路径」里指定现成 ko")
-            null
+        if (File(koPath).exists()) {
+            log("  检测到手动指定的 $koPath，本轮改用它")
+            return File(koPath)
         }
+        log("  ! 没有可用的内核模块")
+        log("    当前机型建议用：${b.asset}（${b.label}）")
+        log("    放一份到下面任一位置后重试：")
+        log("      /sdcard/Download/kernelsu.ko   推荐，会按 vermagic 列出候选")
+        log("      ${f.absolutePath}")
+        log("    也可以在上方「模块路径」里直接指定现成 ko")
+        return null
     }
 
     /** 读不到标识不得当作匹配；只比较完整 release，非 GKI 仍需另核对 CRC/CFI。 */
@@ -1426,14 +1415,19 @@ class MainActivity : ComponentActivity() {
             .lines().map { it.trim() }.filter { it.isNotEmpty() }
         if (cands.isNotEmpty()) {
             var picked: String? = null
+            // 不强制校验版本：每台设备都要针对自己的内核单独编 ko，
+            // 用户自己知道该放哪一个。这里只把对比结果打出来当参考，不拦截。
             for (c in cands) {
                 val head = koVermagic(File(c))?.split(" ")?.firstOrNull()
-                val okVm = matchesKernelRelease(head)
-                log("  Download 候选 $c  vermagic=${head ?: "(读不到)"} -> ${if (okVm) "匹配" else "跳过"}")
-                if (okVm && picked == null) picked = c
+                val same = head == kernelVer
+                log("  Download 候选 $c")
+                log("    vermagic=${head ?: "(读不到明文)"}  /  本机=$kernelVer  ${if (same) "[一致]" else "[不一致，仅供参考]"}")
+                if (picked == null) picked = c
             }
-            if (picked != null) ko = picked
-            else log("  ! Download 里的 ko 都不匹配本机 $kernelVer，改用内置")
+            if (picked != null) {
+                ko = picked
+                log("  采用 $ko（如需换别的，把多余的 ko 移出 Download 或在此指定路径）")
+            }
         }
         if (ko.isNotEmpty()) {
             log("  ko 来源: $ko（Download，vermagic 已匹配）")
@@ -1451,12 +1445,12 @@ class MainActivity : ComponentActivity() {
             log("  内置 ${b.asset}  ${f.length() / 1024} KB  组: ${b.label}")
             log("  ko vermagic: ${vm ?: "(读不到)"}")
             log("  本机 uname  : $kernelVer")
-            val vmOk = matchesKernelRelease(vm)
-            if (!vmOk) {
-                log("  !! vermagic 不匹配（ko=${vm?.split(" ")?.first()}，本机=$kernelVer）")
-                log("     多半是内核小版本不同（如 .155 vs .157）。先别 insmod，找同版本内核的 boot 重编 ko。")
-                log("     若确认本机内核与档案一致，可把 ko 放 /sdcard/Download/ 覆盖内置再试。")
-                return
+            if (!matchesKernelRelease(vm)) {
+                // 不拦截：ko 必须按设备树单独编，版本串对不上不一定意味着不能用
+                // （同一机型的不同 build 可能只差 localversion 后缀）。
+                // 只把差异打出来，装不装由用户决定。
+                log("  ! vermagic 与本机不一致：ko=${vm?.split(" ")?.first()} / 本机=$kernelVer")
+                log("    不拦截，继续 insmod。若加载失败，用同版本内核的 boot 重编 ko 再试。")
             }
             log("  vermagic 匹配")
             if (pushFile(f, "/data/local/tmp/kernelsu.ko")) {
