@@ -953,7 +953,9 @@ class MainActivity : ComponentActivity() {
         if (alreadyExploitedThisBoot()) {
             log("  本次开机已跑过漏洞（boot_id 匹配 .glhold），拒绝重复执行")
             log("  如需重跑，重启设备（重启会重置 init_cred 计数）")
-            return@withContext checkRoot()
+            // 5.4 没有 rksh，checkRoot 恒 false；用模块是否已加载当判据
+            val modOn = sh("[ -d /sys/module/kernelsu ] && echo Y || echo N", 10).out.contains("Y")
+            return@withContext modOn || checkRoot()
         }
         // 模块已在位说明内核侧没必要再动，直接走装载/校验
         if (sh("[ -d /sys/module/kernelsu ] && echo Y || echo N", 10).out.contains("Y")) {
@@ -1179,13 +1181,16 @@ class MainActivity : ComponentActivity() {
                 // 真正的判据是模块加载 + 后续 ksucheck 的 GRANT_ROOT。
                 log("  [${elapsed}s] kernelsu 模块已加载（提权结果由 ksucheck 验证）")
                 markExploited()
-                // 5.4 这条以前直接 return，导致 ksud 从不部署、allowlist 从不写，
-                // 「提权后自动装 KSU」开关在 5.4 上等于摆设。这里补上。
+                // 模块已由 ghostlock54 内部的脚本 insmod（带 kln）。
+                // 但不能走 autoKsuSetup：那里所有 root 操作都依赖 /data/local/tmp/rksh，
+                // 而 rksh 需要 rkshd + rk9.ko，rk9-54.ko 是 Reno7(gaa96) 编的，
+                // 在 A93(g9ef4) 上 insmod 会因 vermagic 不符被拒 —— 等于没有 root shell。
+                // 所以这里只做一件 5.4 上真正能做的事：直接问内核模块活没活。
+                log("  --- 验证内核侧（ksucheck 不需要 root shell）---")
+                verifyKsu()
                 if (autoKsu) {
-                    log("  --- 进入 KSU 装载流程（写 allowlist / 部署 ksud / rmmod 重载）---")
-                    autoKsuSetup()
-                } else {
-                    log("  ! 「提权后自动装 KSU」是关的，跳过装载")
+                    log("  ! 5.4 路径暂无 root shell：ksud 部署与 allowlist 写入需要 rk9 适配 A93，")
+                    log("    当前只能确认模块加载与 supercall 是否可用（见上面 ksucheck 的输出）")
                 }
                 return@withContext true
             }
@@ -1429,17 +1434,24 @@ class MainActivity : ComponentActivity() {
         val ver = sh("/data/local/tmp/rksh -c '/data/adb/ksud --version' 2>&1 | head -3", 60).out.trim()
         log("  ksud --version: ${ver.ifBlank { "(无输出)" }}")
         log("  → 现在打开 KSU 管理器应能看到已安装；若仍显示未安装，重启后再提权一次")
-        // ★ 真验证：直接问内核，而不是拿「模块 Live」这种间接证据当结论。
-        //   reboot hook 装 fd → GET_INFO 拿版本 → GRANT_ROOT 确认 allowlist 生效。
-        // ELF 从 /storage/emulated 执行会 Permission denied（noexec），先推到 /data/local/tmp
+        verifyKsu()
+    }
+
+    /** 直接问内核：supercall 通不通、当前 uid 在不在 allowlist。
+     *
+     *  ksucheck 不需要 root —— 它用自己进程的 uid 走 KSU 的 reboot-magic 拿 fd，
+     *  所以 4.19（有 rksh）和 5.4（没有 root shell）都能用同一个验证。
+     */
+    private fun verifyKsu() {
         val chk = File(File(getExternalFilesDir(null), "bin"), "ksucheck")
-        if (chk.exists() && pushFile(chk, "/data/local/tmp/ksucheck")) {
-            sh("chmod 755 /data/local/tmp/ksucheck 2>/dev/null", 15)
-            log("  --- ksucheck：向内核确认 supercall 与 allowlist ---")
-            log(sh("/data/local/tmp/rksh -c '/data/local/tmp/ksucheck 2>&1'", 60).out.trimEnd())
-        } else {
-            log("  ! ksucheck 未就位，跳过内核侧验证")
+        if (!chk.exists()) { log("  ! ksucheck 未解出，跳过内核侧验证"); return }
+        // ELF 从 /storage/emulated 执行会 Permission denied（noexec）
+        if (!pushFile(chk, "/data/local/tmp/ksucheck")) {
+            log("  ! ksucheck 推送失败，跳过验证"); return
         }
+        sh("chmod 755 /data/local/tmp/ksucheck 2>/dev/null", 15)
+        log("  --- ksucheck：向内核确认 supercall 与 allowlist ---")
+        log(sh("/data/local/tmp/ksucheck 2>&1", 60).out.trimEnd())
     }
 
     /** 上次如果是 panic / 硬重启，p7 输出还留在 /data/local/tmp —— 捞进 App 目录留档 */
